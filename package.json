@@ -1,0 +1,23 @@
+{
+  "name": "zcode-acp",
+  "version": "0.2.0",
+  "description": "ACP agent adapter (v1/v2 negotiated) driving the zcode app-server: streaming, model/reasoning selection, permission prompts; optional headless fallback; cross-platform (Linux / macOS / WSL / Windows)",
+  "type": "module",
+  "bin": {
+    "zcode-acp": "./bin/zcode-acp.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/unit-test.mjs && node test/v1-test.mjs && node test/appserver-unit-test.mjs && node test/e2e-test.mjs && node test/v1-e2e-test.mjs && node test/appserver-e2e-test.mjs",
+    "test:unit": "node test/unit-test.mjs && node test/v1-test.mjs && node test/appserver-unit-test.mjs",
+    "test:e2e": "node test/e2e-test.mjs && node test/v1-e2e-test.mjs && node test/appserver-e2e-test.mjs"
+  },
+  "license": "MIT"
+}

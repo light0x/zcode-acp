@@ -1,0 +1,89 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://agentclientprotocol.com/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Cancellation
+
+> Mechanisms for request cancellation
+
+ACP uses JSON-RPC 2.0 for making requests and getting responses.
+
+The JSON-RPC specification doesn't define any standard mechanism for request cancellation and keeps it up to the implementation.
+
+## `$/cancel_request` Notification
+
+In order to provide a consistent approach to cancellation, ACP defines a `$/cancel_request` notification that can be sent to cancel requests.
+
+Cancellation remains optional as it might not be implementable in all clients or servers. For example if the implementation uses a single threaded synchronous programming language then there is little it can do to react to a `$/cancel_request` notification.
+
+When a `$/cancel_request` notification is received by a supporting implementation, the implementation:
+
+* **MAY** cancel the corresponding request activity and all nested activities related to that request
+* **MAY** finish sending any pending notifications before responding
+* **MUST** send one of these responses for the original request:
+  * A valid response with appropriate data (such as partial results or cancellation marker)
+  * An error response with code [`-32800` (Request Cancelled)](https://agentclientprotocol.com/protocol/v2/schema#errorcode)
+
+The calling side **MAY** implement graceful cancellation processing by waiting for the response from the remote side.
+
+Cancellation **MAY** also be done explicitly on a per-feature basis within the protocol to cover specific scenarios, such as cancellation of [active session work](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#cancellation).
+
+`session/cancel` and `$/cancel_request` have different scopes. Cancelling one
+permission or elicitation request does not automatically cancel the whole
+foreground workflow or determine its state. The Agent applies the aggregate
+[state-transition rules](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#state-transitions).
+
+On `session/cancel`, Clients **MUST** answer pending permissions in that session
+with the `cancelled` outcome. After cancellation completes, Agents **SHOULD** ignore late
+answers rather than use them to resume the cancelled work. After aborting active
+foreground work and sending its final updates, the Agent **MUST** report `idle`
+with `stopReason: "cancelled"`. No additional completion update is required if
+no foreground work was active. See [Elicitation Cancellation](https://agentclientprotocol.com/protocol/v2/elicitation.md#session-cancellation)
+for selective cancellation of related requests and external URL interactions.
+
+## Internal Cancellation
+
+Requests can also be cancelled internally by the executing party without receiving `$/cancel_request`:
+
+* **Client-side examples**: User closes IDE, switches to different project, file becomes unavailable
+* **Agent-side examples**: LLM context limit reached, internal timeout, resource constraints
+
+When internal cancellation occurs, the executing party **SHOULD**:
+
+* Send the same `-32800` (Cancelled) error response as if `$/cancel_request` was received
+* Ensure consistent behavior regardless of cancellation source
+
+Both kinds of cancellation answer `session/prompt` with `-32800` only before the user message is inserted. Once it is inserted, the Agent responds successfully with its `messageId`, and the work it started is stopped with [`session/cancel`](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle#cancellation) or ends with a [stop reason](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#stop-reasons). See [Prompt Accepted](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#2-prompt-accepted).
+
+## Example: Cascading Cancellation Flow
+
+Sending `session/cancel` does not automatically send `$/cancel_request` for outstanding Agent-to-Client requests. An Agent can explicitly propagate cancellation to those requests, but the Client **MUST** answer pending permission requests with the `cancelled` outcome when it sends `session/cancel`, as specified in [active session work cancellation](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#cancellation); it does not wait for `$/cancel_request`.
+
+```mermaid theme={null}
+sequenceDiagram
+    participant Client
+    participant Agent
+
+    Note over Client,Agent: 1. Session prompt in progress
+    Client->>Agent: session/prompt (id=1, "Analyze file X")
+    Agent-->>Client: response to id=1 (messageId)
+    Agent->>Client: session/update (user_message)
+    Agent->>Client: session/update (state_update: running)
+
+    Note over Client,Agent: 2. Agent makes concurrent permission requests
+    Agent->>Client: session/request_permission (id=2, "read sensitive file")
+    Agent->>Client: session/request_permission (id=3, "apply workspace changes")
+
+    Note over Client,Agent: 3. Client cancels active session work
+    Client->>Agent: session/cancel (sessionId)
+
+    Note over Client,Agent: 4. Client cancels pending permission requests
+    Client->>Agent: response to id=2 (outcome: cancelled)
+    Client->>Agent: response to id=3 (outcome: cancelled)
+
+    Note over Client,Agent: 5. Agent stops active work and reports cancellation completion
+    Agent->>Client: session/update (state_update: idle, stopReason: "cancelled")
+```
+
+
+This documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.

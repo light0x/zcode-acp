@@ -1,0 +1,9 @@
+# 扫描工具本地数据
+.mimosa/
+
+# 构建产物
+node_modules/
+*.tgz
+
+# zcode 工作区配置（由 zcode 会话生成，不入库）
+.zcode/

@@ -1,0 +1,155 @@
+> ## Documentation Index
+> Fetch the complete documentation index at: https://agentclientprotocol.com/llms.txt
+> Use this file to discover all available pages before exploring further.
+
+# Slash Commands
+
+> Advertise available slash commands to clients
+
+Agents can advertise a set of slash commands that users can invoke. These commands provide quick access to specific agent capabilities and workflows. Commands are run as part of regular [prompt](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md) requests where the Client includes the command text in the prompt.
+
+## Advertising commands
+
+### Initial commands
+
+The Agent **MAY** include `availableCommands` in the `session/new` and `session/resume` responses, alongside `configOptions` when supported. This lets the Client display commands as soon as [session setup](https://agentclientprotocol.com/protocol/v2/session-setup.md#initial-session-state) completes, without requiring an `available_commands_update` notification before the `session/new` response.
+
+For example, a `session/new` response can advertise a command with text input:
+
+```json theme={null}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "sessionId": "sess_abc123def456",
+    "availableCommands": [
+      {
+        "name": "web",
+        "description": "Search the web for information",
+        "input": {
+          "type": "text",
+          "hint": "query to search for"
+        }
+      }
+    ]
+  }
+}
+```
+
+**availableCommands** `AvailableCommand[]`
+
+Optional initial list of commands available in this session. Omission or `[]`
+means no initial commands are advertised. Empty lists are omitted when
+serializing setup responses.
+
+`null` is not a valid outbound value for this field. Consistent with v2's tolerant deserialization rules, receivers treat `null` or a malformed non-array value like omission and skip invalid command items within an array.
+
+### Notifications
+
+After session setup, the Agent **MAY** announce commands that were not included in the response, or update the list, via the `available_commands_update` session notification:
+
+```json theme={null}
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "sess_abc123def456",
+    "update": {
+      "sessionUpdate": "available_commands_update",
+      "availableCommands": [
+        {
+          "name": "web",
+          "description": "Search the web for information",
+          "input": {
+            "type": "text",
+            "hint": "query to search for"
+          }
+        },
+        {
+          "name": "test",
+          "description": "Run tests for the current project"
+        },
+        {
+          "name": "plan",
+          "description": "Create a detailed implementation plan",
+          "input": {
+            "type": "text",
+            "hint": "description of what to plan"
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+The notification's `availableCommands` array is the complete replacement list, not a delta. An empty array clears all advertised commands.
+
+### AvailableCommand
+
+**name** `string` *required*
+
+The command name (e.g., "web", "test", "plan")
+
+**description** `string` *required*
+
+Human-readable description of what the command does
+
+**input** `AvailableCommandInput`
+
+Optional input specification for the command
+
+### AvailableCommandInput
+
+Currently supports text input with `type: "text"`:
+
+**hint** `string` *required*
+
+A hint to display when the input hasn't been provided yet
+
+Command input specifications can add custom or future `type` values. Custom input types **MUST** begin with `_`; unknown non-underscore input types are reserved for future ACP variants. Clients that cannot render an input specification should preserve it when storing, replaying, proxying, or forwarding command metadata, and otherwise display the command without structured input.
+
+## Dynamic updates
+
+The Agent can update the list of available commands at any time during a session by sending another `available_commands_update` notification. Each notification replaces the list previously advertised in a setup response or notification, including `[]` to clear it. This allows commands to be added based on context, removed when no longer relevant, or modified with updated descriptions.
+
+## Running commands
+
+Commands are included as regular user messages in prompt requests:
+
+```json theme={null}
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "session/prompt",
+  "params": {
+    "sessionId": "sess_abc123def456",
+    "prompt": [
+      {
+        "type": "text",
+        "text": "/web agent client protocol"
+      }
+    ]
+  }
+}
+```
+
+The Agent recognizes the command prefix and processes it accordingly. Commands may be accompanied by any other user message content types (images, audio, etc.) in the same prompt array.
+
+The same [prompt insertion contract](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#2-prompt-accepted) applies to commands: the successful response returns the inserted user message's `messageId`, and the Agent reports that message through a `user_message` update or `user_message_chunk` updates with the same ID.
+
+If a command is handled locally and the runtime does not record it, the adapter inserts a live-only user message into the ACP conversation. It need not wait for a runtime insertion event or keep a permanent transcript entry. If the command is retained and replayed later, it uses the same message ID and is not executed again.
+
+For example, an adapter can report a locally handled `/compact` as a live-only user message containing `/compact`, even if the runtime records only a summary. The ACP user message represents the command invocation; it need not match the runtime's transcript or expanded instructions.
+
+Local handling still uses the
+[foreground lifecycle](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle.md#work-boundaries-and-local-commands).
+From idle, the Agent **MUST** report an active state for command handling and
+`idle` when no foreground work remains, even if no model call or tool invocation
+occurs. A command with no user-action wait uses `running` → `idle`, and
+**SHOULD** include `stopReason: "end_turn"` for successful completion.
+Completing an individual command while other foreground activity continues
+does not require an idle boundary.
+
+
+This documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.

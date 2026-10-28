@@ -498,17 +498,33 @@ async function main() {
   });
 
 
-  await test("命令表：/skill 描述限长（长技能清单收敛）", async () => {
+  await test("命令表：长技能清单全部列为独立命令且 /skill 描述保持简短", async () => {
     const { bridge, client, sent } = makeBridge();
     const many = Array.from({ length: 30 }, (_, i) => ({ name: "skill-" + i, qualifiedName: "plugin:skill-" + i }));
-    client.handlers.set("__noop", {});
     bridge._listCliSkills = async () => ({ skills: many });
-    const { sessionId } = await bridge.createNew({ cwd: "/w" });
-    void sessionId; void client; void sent;
     const cmds = await bridge._availableCommands("/w");
     const skill = cmds.find((c) => c.name === "skill");
-    assert.ok(skill.description.length <= 200, "description should be bounded: " + skill.description.length);
-    assert.ok(skill.description.includes("skill-0") && skill.description.includes("…+"));
+    assert.ok(!skill.description.includes("skill-0"), "/skill 描述不应堆技能名");
+    const skillCmds = cmds.filter((c) => /^plugin:skill-\d+$/.test(c.name));
+    assert.equal(skillCmds.length, 30, "每个技能一条独立命令");
+  });
+
+
+  await test("技能独立命令：每个已加载技能一条 /命令（描述首句限长）", async () => {
+    const { bridge, sent } = makeBridge();
+    bridge._listCliSkills = async () => ({ skills: [
+      { name: "control-browser", qualifiedName: "browser-use:control-browser", description: "Use when opening, navigating, inspecting, testing, clicking, typing, filling, screenshotting, or verifying web pages. Prefer this over Computer Use." },
+      { name: "pdf", qualifiedName: "pdf:pdf" },
+    ] });
+    const r = await bridge.createNew({ cwd: "/w" });
+    const names = r.availableCommands.map((c) => c.name);
+    assert.ok(names.includes("browser-use:control-browser") && names.includes("pdf:pdf"), "individual skill commands missing");
+    const cb = r.availableCommands.find((c) => c.name === "browser-use:control-browser");
+    assert.ok(cb.description.length <= 140, "desc bounded");
+    assert.ok(cb.description.startsWith("Use when opening"), "first sentence kept");
+    assert.deepEqual(cb.input, { type: "text", hint: "task for the browser-use:control-browser skill" });
+    const pdf = r.availableCommands.find((c) => c.name === "pdf:pdf");
+    assert.ok(pdf.description.includes("Invoke the pdf:pdf skill"));
   });
 
   console.log(failures.length ? `\n${failures.length} FAILURES: ${failures.join(", ")}` : "\nALL PASS");

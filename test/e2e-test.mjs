@@ -120,12 +120,13 @@ async function main() {
   const appserverBackend = (process.env.ZCODE_ACP_BACKEND ?? "appserver").trim().toLowerCase() !== "headless";
   check("configOptions 含 model 与 reasoning（仅 appserver 后端）", !appserverBackend || (optIds.includes("zcode.model") && optIds.includes("zcode.reasoning")), optIds.includes("zcode.model") && optIds.includes("zcode.reasoning"), JSON.stringify(optIds));
   const skillCmd = (r.availableCommands ?? []).find((c) => c.name === "skill");
-  // 断言技能清单确实拼入描述即可（具体技能受本机安装数量与排序影响，由单测覆盖）
+  // 每个已加载技能一条独立命令（appserver 后端由服务端 skills list 提供；headless 无技能列表）
   check(
-    "/skill 描述包含技能清单",
-    (skillCmd?.description ?? "").includes("Skills:"),
-    skillCmd?.description?.slice(0, 120),
+    appserverBackend ? "技能以独立命令出现在列表" : "无头后端仅内置命令",
+    !appserverBackend || cmdNames.some((n) => n.includes(":")),
+    JSON.stringify(cmdNames.slice(0, 8)),
   );
+  check("/skill 描述保持简短", (skillCmd?.description ?? "").length <= 200 && !(skillCmd?.description ?? "").includes("browser-use"), skillCmd?.description?.slice(0, 120));
 
   // 3. 简单对话
   r = await request("session/prompt", {

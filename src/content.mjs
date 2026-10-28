@@ -31,17 +31,16 @@ export async function buildAvailableCommands(listCliCommands, listCliSkills) {
   } catch {}
   try {
     const skills = await listCliSkills();
-    const allNames = (skills?.skills ?? []).map((s) => s.qualifiedName ?? s.name).filter(Boolean);
-    if (allNames.length) {
-      const skillCommand = commands.find((c) => c.name === "skill");
-      let description;
-      for (const cap of [12, 8, 4, 2]) {
-        const shown = allNames.slice(0, cap).join(", ");
-        const more = allNames.length > cap ? ` …+${allNames.length - cap}` : "";
-        description = `${skillCommand.description}. Skills: ${shown}${more}`;
-        if (description.length <= 200) break;
-      }
-      skillCommand.description = description;
+    // 每个已加载技能一条独立命令（与桌面一致）；描述取首句并限长
+    for (const s of (skills?.skills ?? [])) {
+      const name = s.qualifiedName ?? s.name;
+      if (!name || commands.some((x) => x.name === name)) continue;
+      const firstSentence = (s.description ?? "").split(/(?<=[.。!？?])\s/)[0] || `Invoke the ${name} skill`;
+      commands.push({
+        name,
+        description: firstSentence.length > 140 ? `${firstSentence.slice(0, 137)}…` : firstSentence,
+        input: { type: "text", hint: `task for the ${name} skill` },
+      });
     }
   } catch {}
   return commands;

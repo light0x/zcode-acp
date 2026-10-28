@@ -107,8 +107,12 @@ async function main() {
     // 与内置重名的自定义命令被去重（只保留一条 compact）
     assert.equal(names.filter((n) => n === "compact").length, 1);
     const skill = r.availableCommands.find((c) => c.name === "skill");
-    assert.ok(skill.description.includes("browser-use:control-browser"));
-    assert.ok(skill.description.includes("command-pitfalls"));
+    // 每个已加载技能一条独立命令（qualifiedName），/skill 不再堆技能名
+    assert.ok(names.includes("browser-use:control-browser") && names.includes("command-pitfalls"));
+    assert.ok(!skill.description.includes("browser-use"), "/skill 描述应保持简短");
+    const cb = r.availableCommands.find((c) => c.name === "browser-use:control-browser");
+    assert.ok(cb, "missing individual skill command");
+    assert.ok(cb.description.length <= 140);
     const scan = r.availableCommands.find((c) => c.name === "mimosa-scan");
     assert.equal(scan.input.hint, "[path]");
   });

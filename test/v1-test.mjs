@@ -111,6 +111,10 @@ async function main() {
     assert.equal(r.modes.currentModeId, "yolo");
     assert.ok(r.modes.available.some((m) => m.id === "plan" && typeof m.name === "string"));
     assert.ok(Array.isArray(r.configOptions) && r.configOptions.some((o) => o.id === "zcode.mode"));
+    const display = r.configOptions.find((o) => o.id === "zcode.thinking_display");
+    assert.ok(display, "v1 应携带思考显示开关");
+    assert.equal(display.currentValue, "concise", "思考显示默认精简");
+    assert.deepEqual(display.options.map((o) => o.value), ["concise", "full"]);
     // 响应到达时命令通知不得抢先（客户端未注册会话会丢弃）
     assert.equal(
       wire.some((w) => w.update?.sessionUpdate === "available_commands_update"),
@@ -207,6 +211,11 @@ async function main() {
       };
     };
     await initV1(client);
+    // 回放思考的出线受思考显示开关控制：切 full 后 load 回放包含思考块
+    await withTimeout(
+      client.request("session/set_config_option", { sessionId: "sess_z1", configId: "zcode.thinking_display", type: "id", value: "full" }),
+      "set thinking display",
+    );
     wire.length = 0;
     const r = await withTimeout(client.request("session/load", { sessionId: "sess_z1", cwd: "/w", mcpServers: [] }), "load");
     assert.equal(r.modes?.currentModeId, "yolo", "load 应答应携带 modes");

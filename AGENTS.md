@@ -66,3 +66,4 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 8. `@` 提及本地文件发送：模型能读到文件内容并围绕其作答；用户消息回显为 chip（不是 `[file: …]` 之类文本）。
 9. 带图 prompt 发送：用户消息里图片只显示一份，不出现重复。
 10. edit/write/read 类工具卡片：目标文件可点击打开（read 定位到对应行）；edit 卡片渲染红绿 diff，同文件多处编辑的标题含 old→new 摘要可区分；标题与输出仍正常展示。
+11. 思考显示开关（Thinking Display）：默认精简——面板无思考流、回复照常；切「完整」后思考实时出线；恢复会话后开关回到默认精简（适配器本地状态，不持久化）。

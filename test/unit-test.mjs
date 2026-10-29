@@ -220,7 +220,7 @@ async function main() {
     assert.ok(Array.isArray(r.configOptions));
     const kinds = sent.map((s) => s.update.sessionUpdate);
     assert.ok(kinds.includes("user_message"));
-    assert.ok(kinds.includes("agent_thought"));
+    assert.ok(!kinds.includes("agent_thought"), "精简模式默认不回放思考");
     assert.ok(kinds.includes("tool_call_update"));
     assert.ok(kinds.includes("agent_message"));
     const last = sent[sent.length - 1].update;
@@ -395,6 +395,19 @@ async function main() {
   });
 
 
+  await test("思考显示默认值：ZCODE_ACP_THINKING_DISPLAY=full 时新会话默认完整", async () => {
+    const saved = process.env.ZCODE_ACP_THINKING_DISPLAY;
+    process.env.ZCODE_ACP_THINKING_DISPLAY = "full";
+    try {
+      const { bridge } = makeBridge();
+      const r = await bridge.createNew({ cwd: "/w" });
+      assert.equal(r.configOptions.find((o) => o.configId === "zcode.thinking_display").currentValue, "full");
+    } finally {
+      if (saved === undefined) delete process.env.ZCODE_ACP_THINKING_DISPLAY;
+      else process.env.ZCODE_ACP_THINKING_DISPLAY = saved;
+    }
+  });
+
   await test("无头流式：stream 事件转分块，无增量时整段兜底", async () => {
     const streaming = makeBridge({
       runPrompt: (args) => {
@@ -408,7 +421,11 @@ async function main() {
     await waitQueue(streaming.bridge, s1.sessionId);
     const chunks = streaming.sent.filter((x) => x.update.sessionUpdate === "agent_message_chunk");
     assert.equal(chunks.map((c) => c.update.content.text).join(""), "PONG");
-    assert.ok(streaming.sent.some((x) => x.update.sessionUpdate === "agent_thought_chunk"));
+    assert.ok(!streaming.sent.some((x) => x.update.sessionUpdate === "agent_thought_chunk"), "精简模式默认不出思考流");
+    await streaming.bridge.setConfigOption({ sessionId: s1.sessionId, configId: "zcode.thinking_display", value: { value: "full" } });
+    await streaming.bridge.prompt({ sessionId: s1.sessionId, blocks: [{ type: "text", text: "x" }] });
+    await waitQueue(streaming.bridge, s1.sessionId);
+    assert.ok(streaming.sent.some((x) => x.update.sessionUpdate === "agent_thought_chunk"), "切 full 后思考流出线");
     assert.ok(!streaming.sent.some((x) => x.update.sessionUpdate === "agent_message"), "已流式时不应整段兜底");
     const fallback = makeBridge({
       runPrompt: () => ({ proc: fakeProc, done: Promise.resolve({ sessionId: "s1", response: "FULL", usage: {} }) }),

@@ -31,6 +31,12 @@ export class AppServerBridge {
   constructor(deps = {}) {
     this.sendUpdate = deps.sendUpdate ?? (() => {});
     this.log = deps.log ?? (() => {});
+    // 思考流显示的会话默认值：ZCODE_ACP_THINKING_DISPLAY=full 打开（缺省精简），面板开关可按会话覆盖
+    const envDisplay = process.env.ZCODE_ACP_THINKING_DISPLAY;
+    this.thinkingDisplayDefault = envDisplay === "full" ? "full" : "concise";
+    if (envDisplay && envDisplay !== "full" && envDisplay !== "concise") {
+      this.log(`invalid ZCODE_ACP_THINKING_DISPLAY=${envDisplay}; using concise`);
+    }
     this.onPermissionRequest = deps.onPermissionRequest;
     this.onElicitation = deps.onElicitation;
     this.bin = resolveZcodeBin(deps.bin);
@@ -314,6 +320,11 @@ export class AppServerBridge {
         },
       });
       st.reasoning = v;
+    } else if (configId === "zcode.thinking_display") {
+      if (v !== "concise" && v !== "full") {
+        throw Object.assign(new Error(`invalid thinking display: ${v}`), { code: -32602 });
+      }
+      st.thinkingDisplay = v;
     } else {
       throw Object.assign(new Error(`unknown config option: ${configId}`), { code: -32602 });
     }
@@ -364,6 +375,7 @@ export class AppServerBridge {
         mode: "yolo",
         model: null, // { providerId, modelId }
         reasoning: null,
+        thinkingDisplay: this.thinkingDisplayDefault, // 思考流出线开关：concise 隐藏 / full 实时显示（适配器本地，不触及协议）
         contextWindow: null,
         zcodeId: sessionId,
         gen: -1,
@@ -572,6 +584,7 @@ export class AppServerBridge {
     const delta = payload.delta ?? "";
     if (!delta) return;
     if (kind === "reasoning_delta") {
+      if (st.thinkingDisplay !== "full") return; // 精简模式默认：思考流不出线
       this._update(st.sessionId, {
         sessionUpdate: "agent_thought_chunk",
         messageId: st.thoughtMsgId,
@@ -835,6 +848,20 @@ export class AppServerBridge {
         });
       }
     }
+    // 思考流出线开关（适配器本地，不改模型的实际思考档位）
+    options.push({
+      configId: "zcode.thinking_display",
+      name: "Thinking Display",
+      description:
+        "Show the model's reasoning stream: concise hides it, full streams it live. Display-only; does not change the model's reasoning effort.",
+      category: "thought_level",
+      type: "select",
+      currentValue: st.thinkingDisplay,
+      options: [
+        { value: "concise", name: "精简 (Concise)", description: "隐藏思考流，只看回复与工具卡片" },
+        { value: "full", name: "完整 (Full)", description: "实时显示模型思考流" },
+      ],
+    });
     return options;
   }
 
@@ -848,6 +875,7 @@ export class AppServerBridge {
 
   // 历史回放（sqlite 只读；v1 session/load 与 v2 replayFrom:start 共用）
   async _replayFromStore(sessionId) {
+    const st = this._state(sessionId);
     const history = await this._readHistory(sessionId);
     let userN = 0;
     let agentN = 0;
@@ -859,7 +887,7 @@ export class AppServerBridge {
           content: [{ type: "text", text: entry.text }],
         });
       } else if (entry.role === "assistant") {
-        if (entry.thoughts.length) {
+        if (entry.thoughts.length && st.thinkingDisplay === "full") {
           this._update(sessionId, {
             sessionUpdate: "agent_thought",
             messageId: `msg_thought_r${agentN}`,

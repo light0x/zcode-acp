@@ -62,31 +62,38 @@ npm i -g C:\path\to\zcode-acp-<version>.tgz
 
 ### Zed 配置
 
-一键脚本会打印对应片段；手动配置参考（路径按实际安装位置调整）：
+前置：本机已完成安装（上文）与 `zcode login`。一键脚本最后会打印与本机安装位置一致的配置片段，直接复制即可；手动配置如下。
+
+**当前版 Zed**——写 `settings.json` 的 `agent_servers` 键（命令面板执行 `zed: open settings` 打开）：
 
 ```jsonc
-// WSL 内的 Zed：~/.config/zed/agents.json
+{
+  "agent_servers": {
+    "ZCode": {
+      "type": "custom",
+      "command": "zcode-acp",   // Windows 下解析不到裸名时改为 "zcode-acp.cmd"
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+**旧版 Zed**（设置里没有 `agent_servers` 键时）——用 `agents.json`：
+
+```jsonc
+// WSL / Linux / macOS：~/.config/zed/agents.json；Windows：%APPDATA%\Zed\agents.json
 [
   {
     "name": "ZCode",
-    "command": { "path": "zcode-acp", "args": [] }
+    "command": { "path": "zcode-acp", "args": [] }   // Windows 改 "zcode-acp.cmd"
   }
 ]
 ```
 
-```jsonc
-// Windows 的 Zed：%APPDATA%\Zed\agents.json
-[
-  {
-    "name": "ZCode",
-    "command": { "path": "zcode-acp.cmd", "args": [] }
-  }
-]
-```
-
-自动探测顺序：`ZCODE_BIN` 环境变量 → `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`
-→ `C:\Program Files\ZCode\resources\glm\zcode.cjs` → PATH 上的 `zcode.exe`。
-若 zcode 装在自定义位置，在 agents.json 的 `command.env` 里指定：
+zcode 装在自定义位置时经 `env` 传入。自动探测顺序：`ZCODE_BIN` 环境变量
+→ `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`
+→ `C:\Program Files\ZCode\resources\glm\zcode.cjs` → PATH 上的 `zcode.exe`：
 
 ```jsonc
 "command": {
@@ -96,7 +103,14 @@ npm i -g C:\path\to\zcode-acp-<version>.tgz
 }
 ```
 
-自检失败时按 `PROBLEM` 行修复（缺 Node、zcode 未登录等），再重跑安装脚本即可。
+`env` 里也可设适配器行为开关，例如思考流默认完整显示（缺省精简）：
+
+```jsonc
+"env": { "ZCODE_ACP_THINKING_DISPLAY": "full" }
+```
+
+配置保存后，Agent 面板的新建会话菜单出现 ZCode，选中即开始对话。SSH remote / WSL 跨端部署见下两节；
+`ZCODE_*` 环境变量一览见「快速开始」。自检失败时按 `PROBLEM` 行修复（缺 Node、zcode 未登录等），再重跑安装脚本即可。
 
 ### 一套配置跨 Windows 与 SSH Linux/WSL
 
@@ -176,6 +190,31 @@ Windows 与 WSL 各有一套 zcode 安装（各自 `~/.zcode` 的登录态、配
 | `ZCODE_ACP_LOG` | 调试日志路径；缺省 `~/.zcode/cli/log/zcode-acp-adapter.log`（5MB 轮转） |
 | `ZCODE_ACP_PROTOCOL_LOG` | app-server 原始出入站流量；缺省 `~/.zcode/cli/log/zcode-acp-protocol.log`（5MB 轮转） |
 | `ZCODE_ACP_BACKEND` | `appserver`（默认）或 `headless`；headless 回退为每 turn 一个 `zcode -p --output-format stream-json` 进程（无模型选择/权限交互；流式经官方 stream-json 事件支持） |
+| `ZCODE_ACP_THINKING_DISPLAY` | 思考流显示的会话默认值：`full` 时默认显示思考流；缺省 `concise`（精简，不显示）。面板开关可按会话覆盖此默认 |
+
+## 会话内配置选项
+
+在 Zed 中的操作位置：接入后（见「Zed 配置」）在 Agent 面板新建会话并选择 ZCode；
+消息输入框上方的会话配置区就是下列选项的选择器（模式 / 模型 / 思考强度 / 思考显示），
+点开选择即时生效。排查选项是否送达可用命令面板 `dev: open acp logs` 查看 ACP 流量。
+
+| 选项 | 取值 | 默认 | 说明 |
+
+| 选项 | 取值 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| Permission Mode（`zcode.mode`） | plan / build / edit / yolo / guarded | yolo | 权限模式，语义与 `zcode --mode` 一致；非 yolo 模式写操作弹权限确认 |
+| Model（`zcode.model`） | 模型目录全量 | 会话当前值 | 切换模型（映射 `session/setModel`） |
+| Thinking（`zcode.reasoning`） | 当前模型的思考档位 | 模型默认档位 | 模型**实际**思考强度；越强思考越久、输出越长 |
+| Thinking Display（`zcode.thinking_display`） | 精简 (Concise) / 完整 (Full) | **精简**（可经 `ZCODE_ACP_THINKING_DISPLAY` 改默认） | 思考流**是否显示**：精简隐藏思考只看回复与工具卡片；完整实时显示思考过程 |
+
+Thinking Display 使用要点：
+
+- 默认精简：觉得思考输出太多无需任何操作；想看推理过程时切到「完整」，下一批思考增量即出线。
+- 想让「完整」成为所有会话的默认：在 Zed 的 `agent_servers.ZCode.env` 里设 `"ZCODE_ACP_THINKING_DISPLAY": "full"`（见「Zed 配置」），面板开关仍可按会话覆盖。
+- 仅是显示开关，不改变模型实际思考强度与计费（那是 Thinking 选项）；两档下回复内容一致。
+- 历史回放（恢复会话）同样遵守开关：精简时回放不含思考块。
+- 适配器本地状态、不持久化：恢复会话后回到默认值（精简或 env 设定的默认），需要时再切一次。
+- 编程切换：v1/v2 均可 `session/set_config_option`（`configId: "zcode.thinking_display"`，值 `concise`/`full`）；非法值返回 `-32602`。
 
 ## 协议版本
 
@@ -207,7 +246,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | `session/resume`（v1 为 `session/load`） | 协议 `session/resume` 重挂（跨适配器重启亦可）；从头回放经 sqlite 历史翻译为更新流 |
 | `session/list` | 只读查询 sqlite `session` 表（按 cwd 过滤，含标题与更新时间） |
 | `session/close` | `session/close` 并释放本地状态 |
-| `session/set_config_option`（v1 为 `session/set_mode`） | `zcode.mode` → `session/setMode`；`zcode.model` / `zcode.reasoning` → `session/setModel`；结果回传更新后的配置 |
+| `session/set_config_option`（v1 为 `session/set_mode`） | `zcode.mode` → `session/setMode`；`zcode.model` / `zcode.reasoning` → `session/setModel`；`zcode.thinking_display` → 适配器本地思考流显示开关；结果回传更新后的配置 |
 | 非法值（`-32602`） | 未知 configId、越界的 model/reasoning 取值 |
 | 斜杠命令（`/compact`、`/skill`、插件命令） | prompt 文本以 `/` 开头时原样透传，由 zcode 服务端处理 |
 | 权限请求（`build`/`edit`/`guarded` 模式） | 服务端反向请求 `interaction/requestPermission` → ACP `session/request_permission`（Zed 权限弹窗）→ `{decision}` 回传；无应答按 deny 收敛 |
@@ -232,13 +271,13 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | --- | --- | --- |
 | session（new/prompt/cancel/resume/list/close/set_config_option） | ✅ | ACP 七个基线方法全实现；会话与历史读写 app-server 协议 + sqlite 会话存储 |
 | 模型 / 思考强度 | ✅ | 全量目录来自 `session/create` 的 `settings.model.available` 快照，`state.updated` 补丁按 model 合并更新当前 provider 的可用集；`zcode.model` / `zcode.reasoning` 两个 config option 映射 `session/setModel`，v1 客户端经 `session/set_config_option` 同样可用。编码套餐账号通道（`account:*-coding-plan`）仅桌面上下文物化——适配器按官方「启动器从受控凭据来源写入临时配置」模式（usage/03-config.md），将凭据库解密的套餐 key 以 `personalModelIds` 形态注入临时个人配置副本（`~/.zcode/cli/zcode-acp-provider-config.json`），使套餐 GLM 模型在独立会话可选 |
-| 流式输出 | ✅ | app-server：`model.streaming` 的 `text_delta` / `reasoning_delta` 逐字翻译为 `agent_message_chunk` / `agent_thought_chunk`；无头回退后端经官方 `--output-format stream-json` 事件同样逐字流式 |
+| 流式输出 | ✅ | app-server：`model.streaming` 的 `text_delta` / `reasoning_delta` 逐字翻译为 `agent_message_chunk` / `agent_thought_chunk`（思考流出线受 `zcode.thinking_display` 控制，默认精简）；无头回退后端经官方 `--output-format stream-json` 事件同样逐字流式 |
 | 权限交互 | ✅ | 非 yolo 模式下 `interaction/requestPermission` → ACP `session/request_permission`（Zed 弹窗）→ `{decision}`；默认 `yolo` 自动放行，可用 config option 切换 |
 | command（斜杠命令） | ✅ | `session/new`/`resume` 返回 `availableCommands`：内置命令（`/compact`、`/skill`）+ `commands list` 的自定义/插件命令（含参数 hint）；用户输入的 `"/name args"` 原样透传（`/compact`、`/skill`、插件命令均已验证生效） |
 | skill（技能） | ✅ | `/skill <name> <task>` 调用；技能清单（`skills list`）拼入 `/skill` 命令描述供挑选；工作区与用户级技能自动生效 |
 | plugin / MCP 服务器 | ✅ | app-server 按工作区自动装配 zcode 已启用插件的全部能力（命令、技能、MCP 服务器、hooks）；ACP `session/new` 的 `mcpServers` 透传不适用（未声明该能力） |
 | memory（记忆） | ✅（随 zcode 配置） | zcode 自身读取 `~/.zcode` 记忆库；ACP 协议无 memory 方法，适配器不做干预 |
-| 工具调用展示 | ⚠️ 部分 | 实时状态迁移（pending → in_progress → completed/failed）与标题、kind；工具输入/输出内容暂不回传 |
+| 工具调用展示 | ✅ | 实时状态迁移（pending → in_progress → completed/failed）；标题带语义（命令原文 / 文件路径 + old→new 摘要）；文件目标带 locations 可点击打开；输出文本随完成事件回传；edit/write 的 `structuredPatch` 转 diff 内容块——Zed 渲染红绿 diff，v1 由 git_patch 文本还原 oldText/newText |
 | 图片/音频输入（prompt image/audio 块） | ✅ | 同一通路：app-server 走官方分块上传协议（v4/attachment/begin→chunk→commit）随 session/send 附件发送；无头后端落临时文件经官方 --attach。模型是否按视觉/听觉处理取决于 zcode 侧对该模型+媒体类型的呈现（实测各模型不一，纯色小图可能诱发逐字节解码） |
 | 任务清单（todo） | ✅ | zcode todos → ACP plan 更新（v1 plan／v2 plan_update），create 快照 + turn 后 diff 同步 |
 | 提问（AskUserQuestion） | ✅ | app-server interaction/requestUserInput → ACP elicitation/create（form 单选），应答按 question 键回传 answers |

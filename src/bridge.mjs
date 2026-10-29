@@ -27,6 +27,9 @@ export class SessionBridge {
   constructor(deps) {
     Object.assign(this, deps);
     this.bin = resolveZcodeBin();
+    // 思考流显示的会话默认值：ZCODE_ACP_THINKING_DISPLAY=full 打开（缺省精简），面板开关可按会话覆盖
+    const envDisplay = process.env.ZCODE_ACP_THINKING_DISPLAY;
+    this.thinkingDisplayDefault = envDisplay === "full" ? "full" : "concise";
     // 外部依赖挂到实例上，测试可注入替身
     this._runPrompt = runPrompt;
     this._listSessions = listSessions;
@@ -45,6 +48,7 @@ export class SessionBridge {
         // 无头进程没有权限客户端，build 等模式的写操作确认无法进行；
         // zcode headless 的默认即 yolo（自动放行），与之保持一致
         mode: "yolo",
+        thinkingDisplay: this.thinkingDisplayDefault, // 思考流出线开关：concise 隐藏 / full 实时显示
         zcodeId: null, // zcode 真实会话 ID（首次 turn 后建立）
         running: null, // { proc, acpMessageId, cancelWaiters }
         queue: [],
@@ -167,6 +171,7 @@ export class SessionBridge {
         const delta = ev?.delta ?? "";
         if (!delta) return;
         if (ev.kind === "reasoning_delta") {
+          if (st.thinkingDisplay !== "full") return; // 精简模式默认：思考流不出线
           this._update(sessionId, {
             sessionUpdate: "agent_thought_chunk",
             messageId: thoughtMsgId,
@@ -281,6 +286,7 @@ export class SessionBridge {
   }
 
   async _replayFromStore(sessionId) {
+    const st = this._state(sessionId);
     const history = await this._readHistory(sessionId);
     let userN = 0;
     let agentN = 0;
@@ -292,7 +298,7 @@ export class SessionBridge {
           content: [{ type: "text", text: entry.text }],
         });
       } else if (entry.role === "assistant") {
-        if (entry.thoughts.length) {
+        if (entry.thoughts.length && st.thinkingDisplay === "full") {
           this._update(sessionId, {
             sessionUpdate: "agent_thought",
             messageId: `msg_thought_r${agentN}`,
@@ -347,14 +353,22 @@ export class SessionBridge {
   }
 
   async setConfigOption({ sessionId, configId, value }) {
+    const st = this._state(sessionId);
+    const v = value?.value ?? value;
+    if (configId === "zcode.thinking_display") {
+      if (v !== "concise" && v !== "full") {
+        throw Object.assign(new Error(`invalid thinking display: ${v}`), { code: -32602 });
+      }
+      st.thinkingDisplay = v;
+      return { configOptions: this._configOptions(sessionId) };
+    }
     if (configId !== "zcode.mode") {
       throw Object.assign(new Error(`unknown config option: ${configId}`), { code: -32602 });
     }
-    const mode = value?.value ?? value;
-    if (!MODE_VALUES.includes(mode)) {
-      throw Object.assign(new Error(`invalid mode: ${mode}`), { code: -32602 });
+    if (!MODE_VALUES.includes(v)) {
+      throw Object.assign(new Error(`invalid mode: ${v}`), { code: -32602 });
     }
-    this._state(sessionId).mode = mode;
+    st.mode = v;
     await this._refreshCommands(sessionId);
     return { configOptions: this._configOptions(sessionId) };
   }
@@ -377,6 +391,19 @@ export class SessionBridge {
           name: MODE_PRESENTATION[id].name,
           description: MODE_PRESENTATION[id].description,
         })),
+      },
+      {
+        configId: "zcode.thinking_display",
+        name: "Thinking Display",
+        description:
+          "Show the model's reasoning stream: concise hides it, full streams it live. Display-only; does not change the model's reasoning effort.",
+        category: "thought_level",
+        type: "select",
+        currentValue: st.thinkingDisplay,
+        options: [
+          { value: "concise", name: "精简 (Concise)", description: "隐藏思考流，只看回复与工具卡片" },
+          { value: "full", name: "完整 (Full)", description: "实时显示模型思考流" },
+        ],
       },
     ];
   }

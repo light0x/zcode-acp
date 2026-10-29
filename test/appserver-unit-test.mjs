@@ -145,7 +145,10 @@ async function main() {
     const r = await bridge.createNew({ cwd: "/w" });
     assert.ok(r.sessionId.startsWith("sess_"));
     const ids = r.configOptions.map((o) => o.configId);
-    assert.deepEqual(ids, ["zcode.mode", "zcode.model", "zcode.reasoning"]);
+    assert.deepEqual(ids, ["zcode.mode", "zcode.model", "zcode.reasoning", "zcode.thinking_display"]);
+    const display = r.configOptions.find((o) => o.configId === "zcode.thinking_display");
+    assert.equal(display.currentValue, "concise", "思考显示默认精简");
+    assert.deepEqual(display.options.map((o) => o.value), ["concise", "full"]);
     const names = r.availableCommands.map((c) => c.name);
     assert.ok(names.includes("goal") && names.includes("compact") && names.includes("skill"), "server slashCommands should merge with adapter builtins");
     const goal = r.availableCommands.find((c) => c.name === "goal");
@@ -183,6 +186,7 @@ async function main() {
   await test("流式：text_delta → agent_message_chunk 同 messageId；turn.completed → usage + idle end_turn", async () => {
     const { bridge, client, sent } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.setConfigOption({ sessionId, configId: "zcode.thinking_display", value: { value: "full" } });
     await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "hi" }] });
     client.evt(sessionId, "model.streaming", { kind: "reasoning_delta", delta: "th" });
     client.evt(sessionId, "model.streaming", { kind: "text_delta", delta: "He" });
@@ -205,6 +209,47 @@ async function main() {
     assert.equal(idle.update.stopReason, "end_turn");
     // 已流式全文，不再整段兜底
     assert.ok(!kindsOf(sent).includes("agent_message"));
+  });
+
+  await test("思考显示：默认精简不出线 reasoning_delta，切 full 后恢复，非法值 -32602", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "hi" }] });
+    client.evt(sessionId, "model.streaming", { kind: "reasoning_delta", delta: "hidden" });
+    await sleep(30);
+    assert.ok(!sent.some((x) => x.update.sessionUpdate === "agent_thought_chunk"), "精简模式下思考流不出线");
+    await bridge.setConfigOption({ sessionId, configId: "zcode.thinking_display", value: { value: "full" } });
+    client.evt(sessionId, "model.streaming", { kind: "reasoning_delta", delta: "shown" });
+    await sleep(30);
+    const thoughts = sent.filter((x) => x.update.sessionUpdate === "agent_thought_chunk");
+    assert.equal(thoughts.length, 1);
+    assert.equal(thoughts[0].update.content.text, "shown");
+    await assert.rejects(
+      () => bridge.setConfigOption({ sessionId, configId: "zcode.thinking_display", value: { value: "off" } }),
+      (e) => e.code === -32602,
+    );
+    client.evt(sessionId, "turn.completed", { status: "success", usage: {} });
+    await sleep(20);
+  });
+
+  await test("思考显示默认值：ZCODE_ACP_THINKING_DISPLAY=full 时新会话默认完整，非法值回落精简", async () => {
+    const saved = process.env.ZCODE_ACP_THINKING_DISPLAY;
+    process.env.ZCODE_ACP_THINKING_DISPLAY = "full";
+    try {
+      const full = makeBridge();
+      assert.equal(full.bridge._state("s_full").thinkingDisplay, "full");
+    } finally {
+      if (saved === undefined) delete process.env.ZCODE_ACP_THINKING_DISPLAY;
+      else process.env.ZCODE_ACP_THINKING_DISPLAY = saved;
+    }
+    process.env.ZCODE_ACP_THINKING_DISPLAY = "bogus";
+    try {
+      const fallback = makeBridge();
+      assert.equal(fallback.bridge._state("s_bogus").thinkingDisplay, "concise", "非法值回落精简");
+    } finally {
+      if (saved === undefined) delete process.env.ZCODE_ACP_THINKING_DISPLAY;
+      else process.env.ZCODE_ACP_THINKING_DISPLAY = saved;
+    }
   });
 
   await test("兜底：无流式分块时以 turn.completed.response 整段送达", async () => {
@@ -425,7 +470,7 @@ async function main() {
     });
     await clientRpc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
     const nr = await clientRpc.request("session/new", { cwd: "/w" });
-    assert.ok(Array.isArray(nr.configOptions) && nr.configOptions.length === 3);
+    assert.ok(Array.isArray(nr.configOptions) && nr.configOptions.length === 4);
     assert.ok(nr.modes.available.length === 5);
     const sid = nr.sessionId;
     const r = await clientRpc.request("session/set_config_option", {
@@ -548,7 +593,7 @@ async function main() {
     const lr = await clientRpc.request("session/load", { sessionId: "sess_old", cwd: "/w" });
     assert.equal(lr.modes?.currentModeId, "guarded", "mode 应取自 resume 响应");
     const ids = (lr.configOptions ?? []).map((o) => o.id);
-    assert.deepEqual(ids, ["zcode.mode", "zcode.model", "zcode.reasoning"], "load 应返回完整 configOptions");
+    assert.deepEqual(ids, ["zcode.mode", "zcode.model", "zcode.reasoning", "zcode.thinking_display"], "load 应返回完整 configOptions");
     assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").currentValue, "prov-a/model-y");
     assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").options.length, CATALOG.length);
     acp.rpc.output.destroy();

@@ -51,8 +51,8 @@
 | type | payload 要点 | zcode-acp 映射 |
 | --- | --- | --- |
 | `turn.started` | input, messageId | → `state_update running` |
-| `model.streaming` | `{assistantMessageId, delta, done, kind}` | `text_delta` → `agent_message_chunk`；`reasoning_delta` → `agent_thought_chunk` |
-| `tool.updated` | `kind`(scheduled/started/batch/…), toolCallId(s), toolName | → `tool_call_update`（pending/in_progress/completed） |
+| `model.streaming` | `{assistantMessageId, delta, done, kind}`；kind 实测 `text_delta`/`reasoning_delta`/`tool_input_start`/`tool_input_delta`/`tool_call`（tool_call 携带完整 input） | `text_delta` → `agent_message_chunk`；`reasoning_delta` → `agent_thought_chunk`；`tool_call` → 输入留档供 `tool.updated` 剥离 input 时回填 |
+| `tool.updated` | `kind` 实测 `scheduled`/`started`/`result`/`batch`；result 载荷 `{success, content, display: {kind: "file_diff", filePath, additions, deletions, structuredPatch: [{oldStart, oldLines, newStart, newLines, lines: [" "/"-"/"+" 前缀行"]}], truncated}, perf, truncated}`（**没有 `output` 字段**）；scheduled 常带 `inputOmitted: true, inputRef: "model_stream"` | → `tool_call_update`（pending/in_progress/completed；content 文本 → rawOutput，structuredPatch → diff 内容块） |
 | `permission.requested` / `permission.resolved` | requestId, toolName, riskLevel, input | 与反向请求并存，zcode-acp 以反向请求为准 |
 | `turn.completed` | response, tokenCount, usage{totalTokens, …}, toolCallCount | → `usage_update` + `state_update idle`（stopReason 按取消/状态映射） |
 | `session.updated` / `session.titleUpdated` / `checkpoint.created` / `streamRecovery.updated` | 元数据 | 暂未消费 |

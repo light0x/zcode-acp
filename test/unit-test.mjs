@@ -2,9 +2,13 @@
 // 单元测试：无头桥接的会话生命周期、turn 队列、取消、resume 回放与配置选项。
 // 通过实例注入替身（_runPrompt/_listSessions/_getSession/_readHistory），不依赖网络与 zcode 进程。
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { SessionBridge } from "../src/bridge.mjs";
 import { zcodeCommand, resolveZcodeBin } from "../src/zcode-headless.mjs";
-import { splitPromptBlocks, toolNameToKind, toolStateToStatus } from "../src/content.mjs";
+import { splitPromptBlocks, toolNameToKind, toolStateToStatus, deriveToolTitle, toolResultText, toolResultDiffBlocks } from "../src/content.mjs";
 
 const failures = [];
 function test(name, fn) {
@@ -287,6 +291,8 @@ async function main() {
       { type: "audio", data: "YXVkaW8=", mimeType: "audio/mpeg" },
     ]);
     assert.ok(r.text.includes("hello") && r.text.includes("b-content"));
+    assert.ok(r.text.includes("[file: file:///tmp/a.rs (a.rs)]"), "不存在的本地文件回落文本提示");
+    assert.equal(r.links.length, 1, "resource_link 原样带回供回显");
     assert.equal(r.media.length, 2);
     assert.equal(r.media[0].mimeType, "image/png");
     assert.deepEqual(r.media[1], { data: "YXVkaW8=", mimeType: "audio/mpeg" });
@@ -294,6 +300,61 @@ async function main() {
     assert.throws(() => splitPromptBlocks([{ type: "audio" }]));
     assert.equal(toolStateToStatus("running"), "in_progress");
     assert.equal(toolNameToKind("Bash"), "execute");
+  });
+
+  test("content：编辑标题带 old→new 摘要；命令标题保持裸命令", () => {
+    const t1 = deriveToolTitle("Edit", { file_path: "/w/a.rs", old_string: "beta line two", new_string: "BETA line two" });
+    assert.ok(t1.startsWith("Edit: /w/a.rs · "), "路径前缀保持原样");
+    assert.ok(t1.includes("beta line two → BETA line two"));
+    const t2 = deriveToolTitle("Edit", { file_path: "/w/a.rs", old_string: "gamma three", new_string: "GAMMA three" });
+    assert.notEqual(t1, t2, "同文件多处编辑的标题应可区分");
+    assert.ok(!deriveToolTitle("Edit", { file_path: "/w/a.rs" }).includes("→"), "无 old/new 时不加摘要");
+    assert.ok(!deriveToolTitle("Write", { file_path: "/w/a.rs", content: "x" }).includes("→"));
+    assert.equal(deriveToolTitle("Bash", { command: "ls -la" }), "ls -la");
+    const long = deriveToolTitle("Edit", { file_path: "/w/a.rs", old_string: "x".repeat(60), new_string: "" });
+    assert.ok(long.length < 120, "摘要双侧限长，标题不失控");
+  });
+
+  test("content：工具结果归一为文本，structuredPatch 转 v2 diff 内容块", () => {
+    assert.equal(toolResultText({ content: "done", perf: {} }), "done", "content 文本优先");
+    assert.equal(toolResultText({ data: 1 }), '{"data":1}', "无 content 回退 JSON");
+    assert.equal(toolResultText("raw"), "raw");
+    assert.equal(toolResultText(undefined), undefined);
+    assert.equal(toolResultText(null), undefined);
+    const blocks = toolResultDiffBlocks({
+      display: {
+        filePath: "/w/a.rs",
+        structuredPatch: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [" alpha", "-beta", "+BETA", " gamma"] }],
+      },
+    });
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].type, "diff");
+    assert.deepEqual(blocks[0].changes, [{ operation: "modify", path: "/w/a.rs", fileType: "text" }]);
+    assert.equal(blocks[0].patch.format, "git_patch");
+    assert.ok(blocks[0].patch.text.includes("@@ -1,3 +1,3 @@"));
+    assert.ok(blocks[0].patch.text.split("\n").some((l) => l === "-beta"), "hunk 行前缀保留");
+    assert.deepEqual(toolResultDiffBlocks({ display: {} }), []);
+    assert.deepEqual(toolResultDiffBlocks(undefined), []);
+  });
+
+  test("content：resource_link 本地文件解析为 files 条目（localPath 直挂）", () => {
+    const p = path.join(os.tmpdir(), `zcode-acp-test-${Date.now()}.md`);
+    fs.writeFileSync(p, "# hi");
+    try {
+      const r = splitPromptBlocks([
+        { type: "text", text: "看这个" },
+        { type: "resource_link", uri: pathToFileURL(p).href, name: "note.md" },
+      ]);
+      assert.equal(r.text, "看这个", "可解析的本地文件不产生文本提示");
+      assert.equal(r.files.length, 1);
+      assert.equal(r.files[0].path, p);
+      assert.equal(r.files[0].name, "note.md");
+      assert.equal(r.files[0].mimeType, "text/plain");
+      assert.equal(r.files[0].size, 4);
+      assert.equal(r.links.length, 1);
+    } finally {
+      fs.rmSync(p, { force: true });
+    }
   });
 
   test("无头图片：image 块落临时文件并经 --attach 传给 runPrompt", async () => {

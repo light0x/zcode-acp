@@ -6,6 +6,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { AppServerBridge } from "../src/appserver-bridge.mjs";
 import { AcpAgent } from "../src/acp-server.mjs";
 import { LineRpc } from "../src/rpc.mjs";
@@ -234,6 +238,100 @@ async function main() {
     assert.equal(first.update.kind, "execute");
   });
 
+  await test("工具输入：model.streaming tool_call 留档，inputOmitted 的 tool.updated 回填完整命令", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "go" }] });
+    const command = "echo " + "A".repeat(120) + "-END";
+    client.evt(sessionId, "model.streaming", { kind: "tool_call", toolCallId: "t2", input: { command } });
+    // 服务端对已流式送达的输入剥离 input（实测 inputOmitted=true, inputRef=model_stream）
+    client.evt(sessionId, "tool.updated", {
+      kind: "scheduled",
+      toolCallId: "t2",
+      toolName: "Bash",
+      inputOmitted: true,
+      inputRef: "model_stream",
+    });
+    client.evt(sessionId, "tool.updated", { kind: "result", toolCallId: "t2", output: "ok" });
+    await wait(
+      sent,
+      (s) => s.filter((x) => x.update.sessionUpdate === "tool_call_update" && x.update.toolCallId === "t2").length >= 2,
+      "tool updates",
+    );
+    const first = sent.find((x) => x.update.sessionUpdate === "tool_call_update" && x.update.toolCallId === "t2");
+    assert.equal(first.update.rawInput?.command, command, "rawInput 应回填完整命令");
+    assert.equal(first.update.title, command, "title 应为裸命令（Zed copy 按 title 原样拷贝）");
+    const done = sent.find((x) => x.update.toolCallId === "t2" && x.update.status === "completed");
+    assert.equal(done.update.rawOutput, "ok", "旧字段 output 兼容出线");
+  });
+
+  await test("工具结果：result 载荷（实测字段）→ rawOutput 取 content 文本，structuredPatch 转 diff 内容块", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "go" }] });
+    client.evt(sessionId, "model.streaming", {
+      kind: "tool_call",
+      toolCallId: "t4",
+      input: { file_path: "/w/a.rs", old_string: "beta", new_string: "BETA" },
+    });
+    client.evt(sessionId, "tool.updated", { kind: "scheduled", toolCallId: "t4", toolName: "Edit", inputOmitted: true, inputRef: "model_stream" });
+    client.evt(sessionId, "tool.updated", {
+      kind: "result",
+      toolCallId: "t4",
+      // 实测形状：字段是 result 而非 output；content 为人读文本，display 带结构化补丁
+      result: {
+        success: true,
+        content: "The file /w/a.rs has been updated successfully.",
+        display: {
+          kind: "file_diff",
+          filePath: "/w/a.rs",
+          additions: 1,
+          deletions: 1,
+          structuredPatch: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [" alpha", "-beta", "+BETA", " gamma"] }],
+          truncated: false,
+        },
+        perf: { totalMs: 20 },
+      },
+    });
+    await wait(sent, (s) => s.some((x) => x.update.toolCallId === "t4" && x.update.status === "completed"), "completed");
+    const upd = sent.find((x) => x.update.toolCallId === "t4" && x.update.status === "completed");
+    assert.equal(upd.update.rawOutput, "The file /w/a.rs has been updated successfully.", "rawOutput 应为 content 文本而非整包对象");
+    assert.equal(upd.update.content?.length, 1, "structuredPatch 应转出 diff 内容块");
+    const diff = upd.update.content[0];
+    assert.equal(diff.type, "diff");
+    assert.deepEqual(diff.changes, [{ operation: "modify", path: "/w/a.rs", fileType: "text" }]);
+    assert.equal(diff.patch.format, "git_patch");
+    assert.ok(diff.patch.text.includes("@@ -1,3 +1,3 @@"), "hunk 头应保留");
+    assert.ok(diff.patch.text.includes("-beta") && diff.patch.text.includes("+BETA"));
+  });
+
+  await test("同文件多处编辑：标题带 old→new 摘要可区分", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "go" }] });
+    client.evt(sessionId, "model.streaming", { kind: "tool_call", toolCallId: "e1", input: { file_path: "/w/a.rs", old_string: "beta two", new_string: "BETA two" } });
+    client.evt(sessionId, "model.streaming", { kind: "tool_call", toolCallId: "e2", input: { file_path: "/w/a.rs", old_string: "gamma three", new_string: "GAMMA three" } });
+    client.evt(sessionId, "tool.updated", { kind: "scheduled", toolCallId: "e1", toolName: "Edit", inputOmitted: true, inputRef: "model_stream" });
+    client.evt(sessionId, "tool.updated", { kind: "scheduled", toolCallId: "e2", toolName: "Edit", inputOmitted: true, inputRef: "model_stream" });
+    await wait(sent, (s) => s.filter((x) => x.update.toolCallId === "e2").length >= 1, "second edit");
+    const t1 = sent.find((x) => x.update.toolCallId === "e1").update.title;
+    const t2 = sent.find((x) => x.update.toolCallId === "e2").update.title;
+    assert.notEqual(t1, t2, "同文件两处编辑的标题应可区分");
+    assert.ok(t1.includes("beta two → BETA two"));
+    assert.ok(t2.includes("gamma three → GAMMA three"));
+  });
+
+  await test("工具位置：file_path 输入派生 locations（客户端可点击打开文件）", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "go" }] });
+    client.evt(sessionId, "model.streaming", { kind: "tool_call", toolCallId: "t3", input: { file_path: "/w/a.rs", line: 3 } });
+    client.evt(sessionId, "tool.updated", { kind: "scheduled", toolCallId: "t3", toolName: "Edit", inputOmitted: true, inputRef: "model_stream" });
+    await wait(sent, (s) => s.some((x) => x.update.toolCallId === "t3"), "tool update");
+    const upd = sent.find((x) => x.update.toolCallId === "t3");
+    assert.deepEqual(upd.update.locations, [{ path: "/w/a.rs", line: 3 }]);
+  });
+
   await test("取消：session/stop 发出，turn 结束后 idle cancelled 且 cancel 返回", async () => {
     const { bridge, client, sent } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });
@@ -305,6 +403,9 @@ async function main() {
     client.handlers.set("session/subscribe", {});
     client.handlers.set("session/setModel", {});
     client.handlers.set("session/send", { accepted: true });
+    client.handlers.set("v4/attachment/begin", { uploadId: "u", state: "staging" });
+    client.handlers.set("v4/attachment/chunk", (p) => ({ uploadId: p.uploadId, nextChunkIndex: p.chunkIndex + 1 }));
+    client.handlers.set("v4/attachment/commit", (p) => ({ ref: "zcode-artifact://test-ref" }));
     const acp = new AcpAgent({
       bridge: new AppServerBridge({
         sendUpdate: (sessionId, update) => acp.sendUpdate(sessionId, update),
@@ -343,6 +444,113 @@ async function main() {
     client.evt(sid, "model.streaming", { kind: "text_delta", delta: "abc" });
     await sleep(30);
     assert.ok(wire.some((w) => w.update.sessionUpdate === "agent_message_chunk"));
+    // v1 用户消息回显只发文本（媒体块由 Zed 乐观渲染，重发会追加成重复 chip）
+    client.evt(sid, "turn.completed", { status: "success", usage: {} });
+    await sleep(20);
+    wire.length = 0;
+    await acp.bridge.prompt({ sessionId: sid, blocks: [{ type: "text", text: "看图" }, { type: "image", data: "aGk=", mimeType: "image/png" }] });
+    await sleep(20);
+    const userChunks = wire.filter((w) => w.update.sessionUpdate === "user_message_chunk");
+    assert.equal(userChunks.length, 1, "回显只出文本块");
+    assert.ok(userChunks.every((w) => w.update.content.type === "text"));
+    acp.rpc.output.destroy();
+  });
+
+  await test("v1 取消：session/cancel 通知形态（Zed 实际行为）触达桥接并以 cancelled 收束 prompt", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", (params) => {
+      client.state({ model: { available: CATALOG } });
+      return {
+        session: { sessionId: "sess_cancel", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+        projection: { contextWindow: 128000, status: "idle" },
+      };
+    });
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    client.handlers.set("session/send", { accepted: true });
+    client.handlers.set("session/stop", {});
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({
+        sendUpdate: (sessionId, update) => acp.sendUpdate(sessionId, update),
+        log: () => {},
+        client,
+      }),
+      log: () => {},
+    });
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    await clientRpc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const sid = (await clientRpc.request("session/new", { cwd: "/w" })).sessionId;
+    const promptP = clientRpc.request("session/prompt", { sessionId: sid, prompt: [{ type: "text", text: "long" }] });
+    await sleep(20);
+    clientRpc.notify("session/cancel", { sessionId: sid });
+    await sleep(20);
+    assert.ok(client.requests.some((r) => r.method === "session/stop"), "cancel 通知应触达桥接并发出 session/stop");
+    client.evt(sid, "turn.completed", { status: "cancelled", usage: {} });
+    assert.deepEqual(await promptP, { stopReason: "cancelled" });
+    acp.rpc.output.destroy();
+  });
+
+  await test("附件：resource_link 本地文件以 file kind + localPath 送达 session/send，回显保留提及块", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const p = path.join(os.tmpdir(), `zcode-acp-test-${Date.now()}.txt`);
+    fs.writeFileSync(p, "hello");
+    try {
+      const { sessionId } = await bridge.createNew({ cwd: "/w" });
+      const link = { type: "resource_link", uri: pathToFileURL(p).href, name: "note.txt" };
+      await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "参考" }, link] });
+      const send = client.requests.find((r) => r.method === "session/send");
+      assert.deepEqual(send.params.attachments, [
+        { kind: "file", filename: "note.txt", mimeType: "text/plain", sizeBytes: 5, localPath: p },
+      ]);
+      const echo = sent.find((x) => x.update.sessionUpdate === "user_message");
+      assert.ok(echo.update.content.some((c) => c.type === "resource_link" && c.uri === link.uri), "回显保留提及块");
+    } finally {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  await test("v1 load：恢复会话应答携带 modes/configOptions（模型/思考选择不丢失）", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", (params) => {
+      client.state({ model: { available: CATALOG } });
+      return {
+        session: { sessionId: "sess_new", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+        projection: { contextWindow: 128000, status: "idle" },
+      };
+    });
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    // 新进程接管旧会话：会话状态只能取自 resume 响应
+    client.handlers.set("session/resume", () => ({
+      messages: [],
+      session: { sessionId: "sess_old", mode: "guarded", model: { providerId: "prov-a", modelId: "model-y" } },
+      settings: { model: { available: CATALOG } },
+    }));
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({
+        sendUpdate: (sessionId, update) => acp.sendUpdate(sessionId, update),
+        log: () => {},
+        client,
+      }),
+      log: () => {},
+    });
+    acp.bridge._readHistory = async () => [];
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    await clientRpc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const lr = await clientRpc.request("session/load", { sessionId: "sess_old", cwd: "/w" });
+    assert.equal(lr.modes?.currentModeId, "guarded", "mode 应取自 resume 响应");
+    const ids = (lr.configOptions ?? []).map((o) => o.id);
+    assert.deepEqual(ids, ["zcode.mode", "zcode.model", "zcode.reasoning"], "load 应返回完整 configOptions");
+    assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").currentValue, "prov-a/model-y");
+    assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").options.length, CATALOG.length);
     acp.rpc.output.destroy();
   });
 
@@ -495,6 +703,38 @@ async function main() {
     const names = upd.update.availableCommands.map((c) => c.name);
     assert.ok(names.includes("scan-b") && !names.includes("scan-a"), "refreshed list should contain scan-b");
     assert.ok(names.includes("compact") && names.includes("skill"));
+  });
+
+
+  await test("resume：返回合并命令表，服务端 slashCommands 取自 resume 响应", async () => {
+    const { bridge, client } = makeBridge();
+    client.handlers.set("session/resume", () => ({
+      messages: [],
+      slashCommands: [{ name: "goal", description: "G.", inputHint: "/goal <objective>" }],
+    }));
+    bridge.catalog = []; // 跳过 _refreshCatalog 的通知等待
+    const r = await bridge.resume({ sessionId: "sess_live", cwd: "/w" });
+    const names = r.availableCommands.map((c) => c.name);
+    assert.ok(names.includes("goal") && names.includes("skill"), "resume 应返回含服务端命令的合并表");
+    const goal = r.availableCommands.find((c) => c.name === "goal");
+    assert.deepEqual(goal.input, { type: "text", hint: "/goal <objective>" });
+    const compact = r.availableCommands.find((c) => c.name === "compact");
+    assert.equal(compact.description, "Compact the zcode session context", "无冲突时保留基线声明");
+  });
+
+  await test("resume：思考档位从会话存储的 model_selection 补齐（resume 响应不带档位）", async () => {
+    const { bridge } = makeBridge();
+    bridge.catalog = CATALOG;
+    bridge._getModelSelection = async () => ({
+      providerId: "prov-a",
+      modelId: "model-y",
+      options: { reasoningLevel: "max" },
+    });
+    const r = await bridge.resume({ sessionId: "sess_reason", cwd: "/w" });
+    const model = r.configOptions.find((o) => o.configId === "zcode.model");
+    const reasoning = r.configOptions.find((o) => o.configId === "zcode.reasoning");
+    assert.equal(model.currentValue, "prov-a/model-y", "模型当前值取自存储");
+    assert.equal(reasoning.currentValue, "max", "思考档位应取自存储");
   });
 
 

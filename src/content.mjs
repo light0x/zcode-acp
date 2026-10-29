@@ -2,6 +2,9 @@
 // ZCode part: text | reasoning | file | tool | step-start | step-finish | snapshot |
 //             patch | compaction | subagent | agent | retry
 // ACP: text | image | audio | resource_link | resource
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // 组装 ACP 斜杠命令表：内置命令（/compact、/skill）+ 自定义/插件命令（含参数 hint）。
 // /skill 描述拼入技能清单供挑选，但只展示前几名并硬限总长（避免长列表撑爆弹窗）。
@@ -93,11 +96,53 @@ export function extForMime(mimeType) {
   return sub || "bin";
 }
 
-// ACP prompt blocks → { text, media }：文本类块拼接为文本，image/audio 块收集为
-// { data(base64), mimeType } 列表（由后端分别经附件上传 / --attach 送达）。
+// ACP prompt blocks → { text, media, files, links }：文本类块拼接为文本，image/audio 块收集为
+// { data(base64), mimeType } 列表；resource_link（Zed @ 提及的出线形态）解析为本地文件条目
+// （由后端以 localPath 附件送达，与桌面 @ 提及同语义），目录/不存在/非 file:// 的引用回落文本提示。
+// links 原样带回供回显（客户端按 chip 渲染）。
+const TEXT_EXTS = new Set([
+  "md", "markdown", "txt", "json", "jsonc", "yaml", "yml", "toml", "xml", "csv", "log", "ini", "cfg", "conf", "env",
+  "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift",
+  "c", "h", "cpp", "hpp", "cs", "php", "sh", "bash", "zsh", "ps1", "psm1", "bat", "cmd", "sql",
+  "html", "htm", "css", "scss", "vue", "svelte", "gitignore", "dockerfile",
+]);
+
+function guessMime(p) {
+  const ext = path.extname(p).slice(1).toLowerCase();
+  if (TEXT_EXTS.has(ext)) return "text/plain";
+  if (ext === "pdf") return "application/pdf";
+  return "application/octet-stream";
+}
+
+function resolveResourceLink(block) {
+  const uri = block.uri ?? "";
+  const name = block.name ?? "";
+  let p = null;
+  if (uri.startsWith("file://")) {
+    try {
+      p = fileURLToPath(uri);
+    } catch {
+      p = null;
+    }
+  }
+  if (p) {
+    try {
+      const s = fs.statSync(p);
+      if (s.isFile()) {
+        return {
+          file: { path: p, name: name || path.basename(p), mimeType: block.mimeType ?? guessMime(p), size: s.size },
+        };
+      }
+    } catch {}
+  }
+  return { cue: `[file: ${uri}${name ? ` (${name})` : ""}]` };
+}
+
 export function splitPromptBlocks(blocks) {
   const parts = [];
   const media = [];
+  const files = [];
+  const links = [];
   for (const block of blocks) {
     switch (block?.type) {
       case "text":
@@ -110,9 +155,13 @@ export function splitPromptBlocks(blocks) {
         }
         media.push({ data: block.data, mimeType: block.mimeType ?? (block.type === "audio" ? "audio/mpeg" : "image/png") });
         break;
-      case "resource_link":
-        parts.push(`[file: ${block.uri ?? ""}${block.name ? ` (${block.name})` : ""}]`);
+      case "resource_link": {
+        const r = resolveResourceLink(block);
+        links.push(block);
+        if (r.cue) parts.push(r.cue);
+        else files.push(r.file);
         break;
+      }
       case "resource": {
         const r = block.resource ?? {};
         const text = typeof r.text === "string" ? r.text : "";
@@ -125,14 +174,14 @@ export function splitPromptBlocks(blocks) {
         });
     }
   }
-  return { text: parts.join("\n"), media };
+  return { text: parts.join("\n"), media, files, links };
 }
 
-// 纯文本场景的便捷包装（无媒体块时行为与旧版一致）
+// 纯文本场景的便捷包装（无媒体/文件/链接块时行为与旧版一致）
 export function promptBlocksToText(blocks) {
-  const { text, media } = splitPromptBlocks(blocks);
-  if (media.length) {
-    throw Object.assign(new Error("media blocks require an media-capable backend"), { code: -32602 });
+  const { text, media, files, links } = splitPromptBlocks(blocks);
+  if (media.length || files.length || links.length) {
+    throw Object.assign(new Error("non-text prompt blocks require a media-capable backend"), { code: -32602 });
   }
   return text;
 }
@@ -172,18 +221,79 @@ export function toolNameToKind(name) {
   return "other";
 }
 
-// 工具 rawInput（ZCode input 对象）→ ACP tool_call_update 的 title 线索
+// 工具 rawInput（ZCode input 对象）→ ACP tool_call_update 的 title 线索。
+// command 不加前缀不截断：Zed 的 copy 按 title 原样拷贝，前缀/省略号会混进命令。
+// 同文件多处编辑的卡片以 old→new 摘要区分，避免一排同路径卡片无法辨认。
 export function deriveToolTitle(toolName, input) {
-  const n = (toolName ?? "").toLowerCase();
   const i = input;
   if (typeof i === "object" && i !== null) {
     for (const key of ["command", "file_path", "path", "file", "url", "pattern", "query", "prompt", "description"]) {
       const v = i[key];
       if (typeof v === "string" && v.trim()) {
+        if (key === "command") return v;
         const shown = v.length > 80 ? v.slice(0, 77) + "..." : v;
-        return `${toolName ?? "tool"}: ${shown}`;
+        const hint = editChangeHint(i);
+        return `${toolName ?? "tool"}: ${shown}${hint ? ` · ${hint}` : ""}`;
       }
     }
   }
   return toolName ?? "tool";
+}
+
+// old_string/new_string 摘要（换行折叠，双侧各限 24 字符）
+function editChangeHint(i) {
+  const oldS = typeof i.old_string === "string" ? i.old_string : "";
+  const newS = typeof i.new_string === "string" ? i.new_string : "";
+  if (!oldS && !newS) return "";
+  const one = (s) => s.replace(/\s+/g, " ").trim().slice(0, 24);
+  return `${one(oldS)} → ${one(newS)}`;
+}
+
+// 工具结果 → 展示文本。app-server 的真实字段是 result（content 字符串 + display 补丁），
+// 无头存储/旧流量为 output；content 字符串优先，其余对象回退 JSON，避免整包 perf 噪声出线。
+export function toolResultText(result) {
+  if (result === undefined || result === null) return undefined;
+  if (typeof result === "string") return result;
+  if (typeof result.content === "string") return result.content;
+  return JSON.stringify(result) ?? String(result);
+}
+
+// result.display.structuredPatch（实测 zcode file_diff）→ v2 diff 内容块，每个 hunk 一块。
+// patch 文本为自生成 git_patch，v1 方言由它还原 oldText/newText 供 Zed 渲染红绿 diff。
+export function toolResultDiffBlocks(result) {
+  const display = result?.display;
+  const hunks = display?.structuredPatch;
+  const filePath = display?.filePath;
+  if (!Array.isArray(hunks) || !hunks.length || typeof filePath !== "string" || !filePath) return [];
+  const blocks = [];
+  for (const h of hunks) {
+    const lines = Array.isArray(h?.lines) ? h.lines : [];
+    if (!lines.length) continue;
+    blocks.push({
+      type: "diff",
+      changes: [{ operation: "modify", path: filePath, fileType: "text" }],
+      patch: {
+        format: "git_patch",
+        text:
+          `diff --git ${filePath} ${filePath}\n--- ${filePath}\n+++ ${filePath}\n` +
+          `@@ -${h.oldStart ?? 0},${h.oldLines ?? 0} +${h.newStart ?? 0},${h.newLines ?? 0} @@\n` +
+          `${lines.join("\n")}\n`,
+      },
+    });
+  }
+  return blocks;
+}
+
+// 工具 rawInput → ACP locations（文件目标），客户端据此渲染可点击的文件位置。
+export function deriveToolLocations(input) {
+  if (typeof input !== "object" || input === null) return [];
+  const out = [];
+  for (const key of ["file_path", "path", "file"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim()) {
+      out.push(typeof input.line === "number" ? { path: v, line: input.line } : { path: v });
+      break;
+    }
+  }
+  return out;
 }

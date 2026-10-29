@@ -207,6 +207,24 @@ export function listCliSkills(bin, cwd) {
   return cachedList(`skills:${bin}:${cwd ?? ""}`, () => runCliJson(bin, ["skills", "list", "--json"], cwd));
 }
 
+// 会话的模型选择（含思考档位）。app-server 的 resume 响应里 session.model 不带档位，
+// 恢复会话时从这里补齐（session_entry 的 runtime/model_selection 条目）。
+export async function getSessionModelSelection(sessionId) {
+  const db = await openDb();
+  if (!db) return null;
+  try {
+    const row = db
+      .prepare(
+        "SELECT data FROM session_entry WHERE session_id = ? AND type = 'runtime/model_selection' ORDER BY time_updated DESC LIMIT 1",
+      )
+      .get(sessionId);
+    const sel = row?.data ? JSON.parse(row.data)?.modelSelection : null;
+    return sel?.providerId && sel?.modelId ? sel : null;
+  } catch {
+    return null;
+  }
+}
+
 // 列出某工作目录下的交互会话（跳过已删除与子代理会话）
 export async function listSessions(cwd, limit = 50) {
   const db = await openDb();

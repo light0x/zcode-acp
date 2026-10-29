@@ -102,8 +102,25 @@ export class AcpAgent {
   }
 
   async _handleNotification(msg) {
-    // 无头模式下没有待取消的 Agent→Client 请求，$/cancel_request 与其他通知忽略
     if (msg.method === "notifications/initialized") return;
+    // session/cancel 在 ACP 里是无 id 通知（Zed 中止按钮走此形态）；带 id 的请求形态由 _handleRequest 分派
+    if (msg.method === "session/cancel") {
+      if (!this.initialized || !msg.params?.sessionId) return;
+      this.bridge.cancel(msg.params.sessionId).catch((err) =>
+        this.log(`acp: session/cancel failed: ${err?.message ?? err}`),
+      );
+      return;
+    }
+    // $/cancel_request：客户端撤销我方未应答的反向请求（权限/提问），按 -32800 收敛
+    if (msg.method === "$/cancel_request") {
+      const id = msg.params?.id;
+      const waiter = id !== undefined ? this.rpc.pending.get(id) : undefined;
+      if (waiter) {
+        this.rpc.pending.delete(id);
+        waiter.reject(jsonRpcError(ERR.REQUEST_CANCELLED, "request cancelled"));
+        this.rpc.respondError(id, ERR.REQUEST_CANCELLED, "request cancelled");
+      }
+    }
   }
 
   sendUpdate(sessionId, update) {

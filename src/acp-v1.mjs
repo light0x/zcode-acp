@@ -77,15 +77,7 @@ export class V1Dialect {
 
   async _sessionNew(params) {
     const r = await this.bridge.createNew({ cwd: required(params, "cwd") });
-    const cfg = (r.configOptions ?? []).find((o) => o.configId === "zcode.mode");
-    const result = { sessionId: r.sessionId };
-    if (cfg) {
-      result.modes = {
-        currentModeId: cfg.currentValue,
-        available: cfg.options.map((v) => ({ id: v.value, name: v.name, description: v.description })),
-      };
-    }
-    if (r.configOptions?.length) result.configOptions = configOptionsToV1(r.configOptions);
+    const result = { sessionId: r.sessionId, ...this._sessionOptions(r) };
     // v1 的 NewSessionResponse 没有 availableCommands 字段：命令只能经
     // available_commands_update 通知送达，但客户端在响应注册会话前会丢弃该通知
     // （Zed 日志: unknown session）。推迟到响应出线之后发送。
@@ -99,7 +91,22 @@ export class V1Dialect {
     return result;
   }
 
-  // v1 session/load 要求回放完历史再应答 {}；session/resume 不回放
+  // v1 会话应答的 modes/configOptions 部分（new/load/resume 同形，LoadSessionResponse 与
+  // NewSessionResponse 携带相同字段）；缺了会导致 Zed 在恢复会话后不显示模型/思考选择
+  _sessionOptions(r) {
+    const cfg = (r.configOptions ?? []).find((o) => o.configId === "zcode.mode");
+    const result = {};
+    if (cfg) {
+      result.modes = {
+        currentModeId: cfg.currentValue,
+        available: cfg.options.map((v) => ({ id: v.value, name: v.name, description: v.description })),
+      };
+    }
+    if (r.configOptions?.length) result.configOptions = configOptionsToV1(r.configOptions);
+    return result;
+  }
+
+  // v1 session/load 要求回放完历史再应答；session/resume 不回放
   async _sessionLoadOrResume(sessionId, cwd, replay) {
     const r = await this.bridge.resume({
       sessionId,
@@ -107,7 +114,7 @@ export class V1Dialect {
       ...(replay ? { replayFrom: { type: "start" } } : {}),
     });
     this._announceCommands(sessionId, r.availableCommands);
-    return {};
+    return this._sessionOptions(r);
   }
 
   // 先登记等待者再发起 prompt：bridge.prompt 外层是 async 包装，若 await 后才登记，
@@ -152,7 +159,18 @@ export class V1Dialect {
   // v2 更新 → 0..n 条 v1 session/update；state_update 不出线，仅用于结束挂起的 prompt
   routeUpdate(sessionId, update) {
     switch (update.sessionUpdate) {
-      case "user_message":
+      case "user_message": {
+        // v1 回显只发文本：Zed 对已发送 prompt 做乐观渲染，重发图片等媒体块会追加成第二个 chip
+        for (const block of update.content ?? []) {
+          if (block.type !== "text") continue;
+          this.agent.notifyUpdate(sessionId, {
+            sessionUpdate: "user_message_chunk",
+            ...(update.messageId !== undefined ? { messageId: update.messageId } : {}),
+            content: block,
+          });
+        }
+        return;
+      }
       case "agent_message":
       case "agent_thought": {
         const variant = CHUNK_VARIANTS[update.sessionUpdate];
@@ -218,6 +236,7 @@ export class V1Dialect {
   _toolCall(sessionId, update) {
     const seen = this.announced.get(sessionId) ?? new Set();
     const first = !seen.has(update.toolCallId);
+    const content = toV1Content(update.content);
     if (first) {
       seen.add(update.toolCallId);
       this.announced.set(sessionId, seen);
@@ -227,7 +246,9 @@ export class V1Dialect {
         title: update.title ?? deriveToolTitle(update.name, update.rawInput),
         kind: update.kind ?? toolNameToKind(update.name),
         status: v1ToolStatus(update.status),
+        ...(update.locations?.length ? { locations: update.locations } : {}),
         ...(update.rawInput !== undefined ? { rawInput: update.rawInput } : {}),
+        ...(content.length ? { content } : {}),
       });
     } else {
       this.agent.notifyUpdate(sessionId, {
@@ -235,8 +256,11 @@ export class V1Dialect {
         toolCallId: update.toolCallId,
         ...(update.title !== undefined ? { title: update.title } : {}),
         ...(update.status !== undefined ? { status: v1ToolStatus(update.status) } : {}),
+        ...(content.length ? { content } : {}),
       });
     }
+    // 内容块（diff/文本）已随本条送达时，rawOutput 文本（多为样板话）不再重复出线
+    if (content.length) return;
     if (update.rawOutput !== undefined && update.rawOutput !== null) {
       this.agent.notifyUpdate(sessionId, {
         sessionUpdate: "tool_call_update",
@@ -268,6 +292,30 @@ function v1StopReason(stopReason) {
 // v1 工具状态枚举没有 cancelled，映射为 failed
 function v1ToolStatus(status) {
   return status === "cancelled" ? "failed" : (status ?? "pending");
+}
+
+// v2 内容块 → v1 ToolCallContent。v1 diff 是 {path, oldText, newText}，由自生成
+// git_patch 文本的 hunk 行（" "/"-"/"+" 前缀）还原两侧文本，Zed 据此渲染红绿 diff。
+function toV1Content(blocks) {
+  const out = [];
+  for (const b of blocks ?? []) {
+    if (b?.type === "diff") {
+      const text = typeof b.patch?.text === "string" ? b.patch.text : "";
+      const at = text.indexOf("\n@@");
+      const body = (at >= 0 ? text.slice(at + 1) : text)
+        .split("\n")
+        .filter((l) => l && !l.startsWith("@@"));
+      out.push({
+        type: "diff",
+        path: b.changes?.[0]?.path ?? "",
+        oldText: body.filter((l) => !l.startsWith("+")).map((l) => l.slice(1)).join("\n"),
+        newText: body.filter((l) => !l.startsWith("-")).map((l) => l.slice(1)).join("\n"),
+      });
+    } else if (b?.type === "content") {
+      out.push(b);
+    }
+  }
+  return out;
 }
 
 function outputToText(rawOutput) {

@@ -8,12 +8,13 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildAvailableCommands, splitPromptBlocks, extForMime, toolNameToKind, deriveToolTitle, MODE_PRESENTATION } from "./content.mjs";
+import { buildAvailableCommands, splitPromptBlocks, extForMime, toolNameToKind, deriveToolTitle, deriveToolLocations, toolResultText, toolResultDiffBlocks, MODE_PRESENTATION } from "./content.mjs";
 import {
   listSessions,
   readHistory,
   listCliCommands,
   listCliSkills,
+  getSessionModelSelection,
   resolveZcodeBin,
 } from "./zcode-headless.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
@@ -39,6 +40,7 @@ export class AppServerBridge {
     this._credentialsCache = null; // { at, map }
     this._listSessions = listSessions;
     this._readHistory = readHistory;
+    this._getModelSelection = getSessionModelSelection;
     this._listCliCommands = listCliCommands;
     this._listCliSkills = listCliSkills;
     // client 可注入替身（测试）；注入对象需实现 ensure/request/on/kill/generation
@@ -111,7 +113,7 @@ export class AppServerBridge {
     const st = this._state(sessionId);
     if (st.closed) throw Object.assign(new Error("session is closed"), { code: -32602 });
     if (!st.cwd) throw Object.assign(new Error("unknown session"), { code: -32602 });
-    const { text, media } = splitPromptBlocks(blocks);
+    const { text, media, files, links } = splitPromptBlocks(blocks);
     await this._attach(st);
     const messageId = `msg_user_${++st.userN}_${uuid().slice(0, 8)}`;
     this._update(sessionId, {
@@ -119,10 +121,15 @@ export class AppServerBridge {
       messageId,
       content: [
         { type: "text", text },
+        ...links,
         ...media.map((m) => ({ type: m.mimeType.startsWith("audio/") ? "audio" : "image", data: m.data, mimeType: m.mimeType })),
       ],
     });
-    const attachments = media.length ? await this._uploadAttachments(sessionId, media) : [];
+    // @ 提及的本地文件直挂 localPath（zcode 附件的 file kind），媒体仍走分块上传
+    const attachments = [
+      ...(media.length ? await this._uploadAttachments(sessionId, media) : []),
+      ...files.map((f) => ({ kind: "file", filename: f.name, mimeType: f.mimeType, sizeBytes: f.size, localPath: f.path })),
+    ];
     // send 受理后才返回（错误 = 消息未插入）；turn 由 _drain 串行执行
     await new Promise((resolve, reject) => {
       st.queue.push({ text, attachments, messageId, resolve, reject });
@@ -143,6 +150,7 @@ export class AppServerBridge {
       cancelRequested: false,
       tools: new Map(), // toolCallId -> status
     };
+    st.toolInputs?.clear(); // 流式工具输入按轮清理，防跨轮累积
     st.agentMsgId = `msg_agent_${++st.lastAgentN}_${uuid().slice(0, 8)}`;
     st.thoughtMsgId = `msg_thought_${st.lastAgentN}_${uuid().slice(0, 8)}`;
     this._update(sessionId, { sessionUpdate: "state_update", state: "running" });
@@ -238,7 +246,7 @@ export class AppServerBridge {
     st.lastCommands = JSON.stringify(mergedCommands);
     return {
       configOptions: this._configOptions(st),
-      availableCommands,
+      availableCommands: mergedCommands,
     };
   }
 
@@ -324,15 +332,25 @@ export class AppServerBridge {
     this._client().catch((err) => this.log(`app-server warmup failed: ${err?.message ?? err}`));
   }
 
-  // 连接换代（app-server 崩溃重启）后重新挂接会话
+  // 连接换代（app-server 崩溃重启）后重新挂接会话；resume 响应与 create 同形，
+  // 无 create 上下文（新进程接管旧会话）时靠它重建模型目录与会话状态
   async _attach(st) {
     if (!st.zcodeId) st.zcodeId = st.sessionId;
     if (st.gen === this.client.generation && this.client.child) return;
     const client = await this._client();
-    await client.request("session/resume", {
+    const r = await client.request("session/resume", {
       sessionId: st.sessionId,
       ...(st.cwd ? { workspace: { workspacePath: st.cwd, workspaceKey: st.cwd } } : {}),
     });
+    if (r?.session?.model) this._adoptModel(st, r.session.model);
+    // resume 响应的 session.model 不带思考档位，从会话存储的 model_selection 补齐
+    const selection = await this._getModelSelection(st.sessionId);
+    if (selection) this._adoptModel(st, selection);
+    if (Array.isArray(r?.settings?.model?.available) && r.settings.model.available.length) {
+      this.catalog = this._mergeCatalog(this.catalog, r.settings.model.available);
+    }
+    if (r?.session?.mode && MODE_VALUES.includes(r.session.mode)) st.mode = r.session.mode;
+    if (Array.isArray(r?.slashCommands) && r.slashCommands.length) st.serverSlashCommands = r.slashCommands;
     await client.request("session/subscribe", { sessionId: st.sessionId, deliveryKind: "desktop-continuous" });
     st.gen = client.generation;
   }
@@ -355,7 +373,7 @@ export class AppServerBridge {
         lastAgentN: 0,
         closed: false,
         turnWaiters: [],
-        serverSlashCommands: [], // create 时由服务端声明填充
+        serverSlashCommands: [], // create/resume 时由服务端声明填充
         lastCommands: null,
       };
       this.sessions.set(sessionId, st);
@@ -544,6 +562,13 @@ export class AppServerBridge {
 
   _onStreaming(st, payload) {
     const kind = payload.kind;
+    // tool_call 事件携带完整输入。app-server 对已流出的输入会在 tool.updated 上剥离
+    // input（inputOmitted/inputRef=model_stream），不留档则客户端只见工具名不见命令。
+    if (kind === "tool_call" && payload.toolCallId && payload.input !== undefined) {
+      st.toolInputs ??= new Map();
+      st.toolInputs.set(payload.toolCallId, payload.input);
+      return;
+    }
     const delta = payload.delta ?? "";
     if (!delta) return;
     if (kind === "reasoning_delta") {
@@ -560,7 +585,7 @@ export class AppServerBridge {
         content: { type: "text", text: delta },
       });
     }
-    // tool_input_* 不出线：工具输入随 tool.updated 生命周期体现
+    // tool_input_delta 不出线：增量只是原始 JSON 分片，完整输入已由 tool_call 事件送达
   }
 
   _onTool(st, payload) {
@@ -581,15 +606,23 @@ export class AppServerBridge {
       const toolName = payload.toolName ?? st.toolNames?.get(toolCallId) ?? toolCallId;
       st.toolNames ??= new Map();
       st.toolNames.set(toolCallId, toolName);
+      // 已流式送达的输入被服务端剥离时，回填 tool_call 事件留档的完整输入
+      const input = payload.input !== undefined ? payload.input : st.toolInputs?.get(toolCallId);
+      const locations = deriveToolLocations(input);
+      // 结果字段实测为 result（content + display.structuredPatch）；output 为旧快照兼容
+      const result = payload.result ?? payload.output;
+      const diffBlocks = toolResultDiffBlocks(result);
       this._update(st.sessionId, {
         sessionUpdate: "tool_call_update",
         toolCallId,
         name: toolName,
-        title: deriveToolTitle(toolName, payload.input),
+        title: deriveToolTitle(toolName, input),
         kind: toolNameToKind(toolName),
         status,
-        ...(payload.input !== undefined ? { rawInput: payload.input } : {}),
-        ...(payload.output !== undefined && payload.output !== null ? { rawOutput: payload.output } : {}),
+        ...(locations.length ? { locations } : {}),
+        ...(input !== undefined ? { rawInput: input } : {}),
+        ...(diffBlocks.length ? { content: diffBlocks } : {}),
+        ...(result !== undefined && result !== null ? { rawOutput: toolResultText(result) } : {}),
       });
     }
   }
@@ -835,6 +868,8 @@ export class AppServerBridge {
         }
         for (const tool of entry.tools) {
           const status = mapToolStatus(tool.status);
+          const locations = deriveToolLocations(tool.input);
+          const diffBlocks = toolResultDiffBlocks(tool.output);
           this._update(sessionId, {
             sessionUpdate: "tool_call_update",
             toolCallId: `tool_r_${tool.callId ?? uuid().slice(0, 8)}`,
@@ -842,8 +877,10 @@ export class AppServerBridge {
             title: deriveToolTitle(tool.tool, tool.input),
             kind: toolNameToKind(tool.tool),
             status,
+            ...(locations.length ? { locations } : {}),
             ...(tool.input !== undefined ? { rawInput: tool.input } : {}),
-            ...(tool.output !== undefined && tool.output !== null ? { rawOutput: tool.output } : {}),
+            ...(diffBlocks.length ? { content: diffBlocks } : {}),
+            ...(tool.output !== undefined && tool.output !== null ? { rawOutput: toolResultText(tool.output) } : {}),
           });
         }
         if (entry.texts.length) {

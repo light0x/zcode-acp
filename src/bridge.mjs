@@ -5,7 +5,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildAvailableCommands, splitPromptBlocks, extForMime, toolNameToKind, deriveToolTitle, MODE_PRESENTATION } from "./content.mjs";
+import { buildAvailableCommands, splitPromptBlocks, extForMime, toolNameToKind, deriveToolTitle, deriveToolLocations, toolResultText, toolResultDiffBlocks, MODE_PRESENTATION } from "./content.mjs";
 import {
   runPrompt,
   resolveZcodeBin,
@@ -109,7 +109,7 @@ export class SessionBridge {
     const st = this._state(sessionId);
     if (st.closed) throw Object.assign(new Error("session is closed"), { code: -32602 });
     if (!st.cwd) throw Object.assign(new Error("unknown session"), { code: -32602 });
-    const { text, media } = splitPromptBlocks(blocks);
+    const { text, media, files, links } = splitPromptBlocks(blocks);
     const messageId = `msg_user_${++st.userN}_${uuid().slice(0, 8)}`;
     // 插入即完成：本地记录并上报后立即响应，turn 异步执行
     this._update(sessionId, {
@@ -117,11 +117,12 @@ export class SessionBridge {
       messageId,
       content: [
         { type: "text", text },
+        ...links,
         ...media.map((m) => ({ type: m.mimeType.startsWith("audio/") ? "audio" : "image", data: m.data, mimeType: m.mimeType })),
       ],
     });
     return new Promise((resolve) => {
-      st.queue.push({ text, media, messageId });
+      st.queue.push({ text, media, files, messageId });
       resolve({ messageId });
       this._drain(sessionId);
     });
@@ -135,24 +136,25 @@ export class SessionBridge {
     this._runTurn(sessionId, next).catch((err) => this.log(`turn failed: ${err?.message ?? err}`));
   }
 
-  async _runTurn(sessionId, { text, media }) {
+  async _runTurn(sessionId, { text, media, files }) {
     const st = this._state(sessionId);
     this._update(sessionId, { sessionUpdate: "state_update", state: "running" });
     const agentMsgId = `msg_agent_${++st.lastAgentN}_${uuid().slice(0, 8)}`;
     const thoughtMsgId = `msg_thought_${st.lastAgentN}_${uuid().slice(0, 8)}`;
     let textLen = 0;
-    // 图片块落临时文件，经官方 --attach 送达；turn 结束后清理
-    const attachPaths = [];
+    // 图片块落临时文件、@ 提及的本地文件直挂路径，均经官方 --attach 送达；仅临时文件参与清理
+    const tempFiles = [];
     for (const [i, img] of (media ?? []).entries()) {
       try {
         const ext = extForMime(img.mimeType);
         const p = path.join(os.tmpdir(), `zcode-acp-media-${sessionId.slice(0, 12)}-${Date.now()}-${i}.${ext}`);
         fs.writeFileSync(p, Buffer.from(img.data, "base64"));
-        attachPaths.push(p);
+        tempFiles.push(p);
       } catch {
         // 单张写盘失败不阻断 turn
       }
     }
+    const attachPaths = [...(files ?? []).map((f) => f.path), ...tempFiles];
     const run = this._runPrompt({
       bin: this.bin,
       text,
@@ -217,7 +219,7 @@ export class SessionBridge {
         });
       }
     } finally {
-      for (const p of attachPaths) {
+      for (const p of tempFiles) {
         try {
           fs.rmSync(p, { force: true });
         } catch {}
@@ -298,6 +300,8 @@ export class SessionBridge {
           });
         }
         for (const tool of entry.tools) {
+          const locations = deriveToolLocations(tool.input);
+          const diffBlocks = toolResultDiffBlocks(tool.output);
           this._update(sessionId, {
             sessionUpdate: "tool_call_update",
             toolCallId: `tool_r_${tool.callId ?? uuid().slice(0, 8)}`,
@@ -305,8 +309,10 @@ export class SessionBridge {
             title: deriveToolTitle(tool.tool, tool.input),
             kind: toolNameToKind(tool.tool),
             status: mapToolStatus(tool.status),
+            ...(locations.length ? { locations } : {}),
             ...(tool.input !== undefined ? { rawInput: tool.input } : {}),
-            ...(tool.output !== undefined && tool.output !== null ? { rawOutput: tool.output } : {}),
+            ...(diffBlocks.length ? { content: diffBlocks } : {}),
+            ...(tool.output !== undefined && tool.output !== null ? { rawOutput: toolResultText(tool.output) } : {}),
           });
         }
         if (entry.texts.length) {

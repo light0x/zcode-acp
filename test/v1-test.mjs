@@ -186,7 +186,7 @@ async function main() {
     assert.deepEqual(await promptP, { stopReason: "cancelled" });
   });
 
-  await test("session/load：回放（tool_call 先建后更）且应答 {}，后续 turn 走 --resume", async () => {
+  await test("session/load：回放（tool_call 先建后更）且应答携带 modes/configOptions，后续 turn 走 --resume", async () => {
     const calls = { prompts: [] };
     const { bridge, client, wire } = makeEnv({
       readHistory: async () => [
@@ -209,7 +209,8 @@ async function main() {
     await initV1(client);
     wire.length = 0;
     const r = await withTimeout(client.request("session/load", { sessionId: "sess_z1", cwd: "/w", mcpServers: [] }), "load");
-    assert.deepEqual(r, {});
+    assert.equal(r.modes?.currentModeId, "yolo", "load 应答应携带 modes");
+    assert.ok(r.configOptions?.some((o) => o.id === "zcode.mode"), "load 应答应携带 configOptions");
     const kinds = wire.map((w) => w.update?.sessionUpdate);
     assert.ok(kinds.includes("user_message_chunk") && kinds.includes("agent_thought_chunk"));
     const callIdx = kinds.indexOf("tool_call");
@@ -218,6 +219,7 @@ async function main() {
     const call = wire[callIdx].update;
     assert.equal(call.kind, "read");
     assert.deepEqual(call.rawInput, { path: "/w/a" });
+    assert.deepEqual(call.locations, [{ path: "/w/a" }], "文件目标应带 locations 供客户端点击打开");
     const contentUpdate = wire
       .filter((w) => w.update?.sessionUpdate === "tool_call_update")
       .find((w) => w.update.content);
@@ -241,7 +243,8 @@ async function main() {
     });
     await initV1(client);
     const r = await withTimeout(client.request("session/resume", { sessionId: "sess_z1", cwd: "/w" }), "resume");
-    assert.deepEqual(r, {});
+    assert.equal(r.modes?.currentModeId, "yolo", "resume 应答应携带 modes");
+    assert.ok(r.configOptions?.some((o) => o.id === "zcode.mode"), "resume 应答应携带 configOptions");
     assert.equal(wire.filter((w) => w.update?.sessionUpdate?.endsWith("_chunk")).length, 0);
   });
 
@@ -314,6 +317,45 @@ async function main() {
     assert.ok(plan, "v1 plan missing");
     assert.equal(plan.entries[0].content, "a");
     assert.equal(plan.planId, undefined);
+    acp.rpc.output.destroy();
+  });
+
+  await test("v1 diff 内容块：桥接 v2 diff 由 git_patch 文本还原 oldText/newText 随 create 送达，rawOutput 不重复", async () => {
+    const env = makeEnv();
+    const acp = new AcpAgent({ bridge: env.bridge, log: () => {} });
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const client = new LineRpc({ withJsonRpc: true });
+    client.attach(toClient, toAgent);
+    const wire = [];
+    client.on("notification", (m) => { if (m.method === "session/update") wire.push(m.params.update); });
+    await client.request("initialize", { protocolVersion: 1 });
+    const nr = await client.request("session/new", { cwd: "/w" });
+    acp.sendUpdate(nr.sessionId, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: "d1",
+      name: "Edit",
+      kind: "edit",
+      status: "completed",
+      title: "Edit: /w/a.rs",
+      content: [{
+        type: "diff",
+        changes: [{ operation: "modify", path: "/w/a.rs", fileType: "text" }],
+        patch: { format: "git_patch", text: "diff --git /w/a.rs /w/a.rs\n--- /w/a.rs\n+++ /w/a.rs\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n" },
+      }],
+      rawOutput: "The file /w/a.rs has been updated successfully.",
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const create = wire.find((u) => u.sessionUpdate === "tool_call" && u.toolCallId === "d1");
+    assert.ok(create, "首次更新应合成为 tool_call create");
+    assert.equal(create.content?.length, 1, "diff 块应随 create 送达");
+    assert.equal(create.content[0].type, "diff");
+    assert.equal(create.content[0].path, "/w/a.rs");
+    assert.equal(create.content[0].oldText, "alpha\nbeta\ngamma");
+    assert.equal(create.content[0].newText, "alpha\nBETA\ngamma");
+    const extra = wire.filter((u) => u.sessionUpdate === "tool_call_update" && u.toolCallId === "d1" && u.content);
+    assert.equal(extra.length, 0, "diff 块已送达时 rawOutput 样板文本不应重复出线");
     acp.rpc.output.destroy();
   });
 

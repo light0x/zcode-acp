@@ -252,6 +252,16 @@ async function main() {
     }
   });
 
+  await test("usage_update：contextWindow 未知时不发（v2 要求 used/size 均必填）", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    delete bridge.sessions.get(sessionId).contextWindow;
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "hi" }] });
+    client.evt(sessionId, "turn.completed", { status: "success", response: "ok", usage: { totalTokens: 42 } });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update" && x.update.state === "idle"), "idle");
+    assert.ok(!sent.some((x) => x.update.sessionUpdate === "usage_update"), "缺 size 时不应发 usage_update");
+  });
+
   await test("兜底：无流式分块时以 turn.completed.response 整段送达", async () => {
     const { bridge, client, sent } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });

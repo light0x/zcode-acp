@@ -280,6 +280,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | 工具调用展示 | ✅ | 实时状态迁移（pending → in_progress → completed/failed）；标题带语义（命令原文 / 文件路径 + old→new 摘要）；文件目标带 locations 可点击打开；输出文本随完成事件回传；edit/write 的 `structuredPatch` 转 diff 内容块——Zed 渲染红绿 diff，v1 由 git_patch 文本还原 oldText/newText |
 | 图片/音频输入（prompt image/audio 块） | ✅ | 同一通路：app-server 走官方分块上传协议（v4/attachment/begin→chunk→commit）随 session/send 附件发送；无头后端落临时文件经官方 --attach。模型是否按视觉/听觉处理取决于 zcode 侧对该模型+媒体类型的呈现（实测各模型不一，纯色小图可能诱发逐字节解码） |
 | 任务清单（todo） | ✅ | zcode todos → ACP plan 更新（v1 plan／v2 plan_update），create 快照 + turn 后 diff 同步 |
+| 上下文容量指示 | ✅（数据侧） | 每轮结束发 `usage_update`（`used` 实测为当前上下文占用——基线+增量+本轮输出，非计费累计；`size` 取模型 contextWindow；按规范成对发送，缺一不发）。**注意：当前已发布的 Zed 尚未渲染该通知**（源码与更新日志均无此 UI），数据就绪，Zed 实现后自动显示，期间可用 `/compact` 主动压缩上下文 |
 | 提问（AskUserQuestion） | ✅ | app-server interaction/requestUserInput → ACP elicitation/create（form 单选），应答按 question 键回传 answers |
 | 会话历史（v1） | ✅ | v1 session/list＋session/close 路由并声明 sessionCapabilities；Zed 历史浏览器可用 |
 

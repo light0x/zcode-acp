@@ -27,8 +27,9 @@
 | `session/resume` | `{sessionId, workspace?}` | `{messages: [...]}` | 可跨进程重挂已持久化会话，响应自带历史 |
 | `session/read` / `session/messages` | `{sessionId}` | `{messages: [...]}` | 历史读取 |
 | `session/list` | `{}` | `{sessions: [{sessionId, mode, status, title, sessionKind, updatedAt, …}]}` | |
+| `session/usage` | `{sessionId}` | `{totalTokens, inputTokens, outputTokens, reasoningTokens, cacheCreationTokens, cacheReadTokens, modelRequestCount, modelErrorCount, inputBaselineBySource}` | **计费累计统计**：totalTokens 是累计消耗而非当前上下文占用，不可用作 usage_update.used |
 | `session/close` | `{sessionId}` | `{}` | |
-| `session/compact` / `session/fork` / `session/goal` / `session/subagents` / `session/usage` / `session/debug` / `session/cancelBackgroundTask` | 未探明 | — | 方法注册表存在，zcode-acp 暂未使用 |
+| `session/compact` / `session/fork` / `session/goal` / `session/subagents` / `session/debug` / `session/cancelBackgroundTask` | 未探明 | — | 方法注册表存在，zcode-acp 暂未使用 |
 
 ## 服务端 → 客户端反向请求
 
@@ -54,7 +55,7 @@
 | `model.streaming` | `{assistantMessageId, delta, done, kind}`；kind 实测 `text_delta`/`reasoning_delta`/`tool_input_start`/`tool_input_delta`/`tool_call`（tool_call 携带完整 input） | `text_delta` → `agent_message_chunk`；`reasoning_delta` → `agent_thought_chunk`（受 `zcode.thinking_display` 开关控制，默认 concise 不出线）；`tool_call` → 输入留档供 `tool.updated` 剥离 input 时回填 |
 | `tool.updated` | `kind` 实测 `scheduled`/`started`/`result`/`batch`；result 载荷 `{success, content, display: {kind: "file_diff", filePath, additions, deletions, structuredPatch: [{oldStart, oldLines, newStart, newLines, lines: [" "/"-"/"+" 前缀行"]}], truncated}, perf, truncated}`（**没有 `output` 字段**）；scheduled 常带 `inputOmitted: true, inputRef: "model_stream"` | → `tool_call_update`（pending/in_progress/completed；content 文本 → rawOutput，structuredPatch → diff 内容块） |
 | `permission.requested` / `permission.resolved` | requestId, toolName, riskLevel, input | 与反向请求并存，zcode-acp 以反向请求为准 |
-| `turn.completed` | response, tokenCount, usage{totalTokens, …}, toolCallCount | → `usage_update` + `state_update idle`（stopReason 按取消/状态映射） |
+| `turn.completed` | response, tokenCount, usage{totalTokens, …}, toolCallCount；usage.totalTokens 实测 ≈ 当前上下文占用（基线 + 增量 + 本轮输出；两轮实测 22118 → 23358），非跨轮计费累计 | → `usage_update`（Zed 上下文容量表的数据源）+ `state_update idle`（stopReason 按取消/状态映射） |
 | `session.updated` / `session.titleUpdated` / `checkpoint.created` / `streamRecovery.updated` | 元数据 | 暂未消费 |
 
 - `v4/telemetry/event`、`process/mcpTelemetry`、`process/resourceSample`、`computer-use/operation-event`：遥测/观测流，不出线到 ACP。

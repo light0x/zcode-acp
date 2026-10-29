@@ -411,11 +411,12 @@ export class SessionBridge {
   _emitUsage(sessionId, usage, projection) {
     const total = usage?.totalTokens ?? usage?.totalTokenCount ?? projection?.totalTokenCount;
     const size = projection?.contextWindow;
-    if (typeof total !== "number") return;
+    // used/size 均为 v2 规范必填：缺一不发
+    if (typeof total !== "number" || typeof size !== "number") return;
     this._update(sessionId, {
       sessionUpdate: "usage_update",
       used: total,
-      ...(typeof size === "number" ? { size } : {}),
+      size,
     });
   }
 }

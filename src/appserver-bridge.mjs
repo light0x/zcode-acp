@@ -415,11 +415,12 @@ export class AppServerBridge {
     const turn = st.turn;
     st.turn = null;
     for (const w of st.turnWaiters.splice(0)) w();
-    if (usage?.totalTokens !== undefined) {
+    // used/size 均为 v2 规范必填：size（contextWindow）未知时不发，避免客户端整条丢弃
+    if (usage?.totalTokens !== undefined && typeof st.contextWindow === "number") {
       this._update(sessionId, {
         sessionUpdate: "usage_update",
         used: usage.totalTokens,
-        ...(typeof st.contextWindow === "number" ? { size: st.contextWindow } : {}),
+        size: st.contextWindow,
       });
     }
     // 流式未送达任何文本时（异常路径），用 turn.completed 的整段回复兜底

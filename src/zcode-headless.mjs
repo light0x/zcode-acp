@@ -225,8 +225,26 @@ export async function getSessionModelSelection(sessionId) {
   }
 }
 
+// ACP session/list 游标分页：cursor 为不透明 base64url JSON {offset}，非法值回落第一页；
+// 还有后续页时返回 nextCursor。页大小 50。
+export function paginateSessions(sessions, cursor, pageSize = 50) {
+  let offset = 0;
+  if (typeof cursor === "string" && cursor) {
+    try {
+      const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+      if (Number.isInteger(parsed?.offset) && parsed.offset >= 0) offset = parsed.offset;
+    } catch {}
+  }
+  const page = sessions.slice(offset, offset + pageSize);
+  if (!page.length) return { sessions: [] };
+  return {
+    sessions: page,
+    ...(offset + page.length < sessions.length ? { nextCursor: Buffer.from(JSON.stringify({ offset: offset + pageSize })).toString("base64url") } : {}),
+  };
+}
+
 // 列出某工作目录下的交互会话（跳过已删除与子代理会话）
-export async function listSessions(cwd, limit = 50) {
+export async function listSessions(cwd, limit = 500) {
   const db = await openDb();
   if (!db) return [];
   try {

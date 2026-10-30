@@ -40,7 +40,9 @@ export class V1Dialect {
       protocolVersion: 1,
       agentCapabilities: {
         loadSession: true,
-        promptCapabilities: { image: true, audio: false, embeddedContext: false },
+        // 音频上传链实测可用（v4/attachment 接受 audio/*）；模型是否消费取决于其
+        // inputFormat.supportsAudio，与 image 在非视觉模型上的行为同口径
+        promptCapabilities: { image: true, audio: true, embeddedContext: false },
         mcpCapabilities: {},
         sessionCapabilities: { list: {}, resume: {}, close: {} },
       },

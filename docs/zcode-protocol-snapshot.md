@@ -56,7 +56,8 @@
 | `tool.updated` | `kind` 实测 `scheduled`/`started`/`result`/`batch`；result 载荷 `{success, content, display: {kind: "file_diff", filePath, additions, deletions, structuredPatch: [{oldStart, oldLines, newStart, newLines, lines: [" "/"-"/"+" 前缀行"]}], truncated}, perf, truncated}`（**没有 `output` 字段**）；scheduled 常带 `inputOmitted: true, inputRef: "model_stream"` | → `tool_call_update`（pending/in_progress/completed；content 文本 → rawOutput，structuredPatch → diff 内容块） |
 | `permission.requested` / `permission.resolved` | requestId, toolName, riskLevel, input | 与反向请求并存，zcode-acp 以反向请求为准 |
 | `turn.completed` | response, tokenCount, usage{totalTokens, …}, toolCallCount；usage.totalTokens 实测 ≈ 当前上下文占用（基线 + 增量 + 本轮输出；两轮实测 22118 → 23358），非跨轮计费累计 | → `usage_update`（Zed 上下文容量表的数据源）+ `state_update idle`（stopReason 按取消/状态映射） |
-| `session.updated` / `session.titleUpdated` / `checkpoint.created` / `streamRecovery.updated` | 元数据 | 暂未消费 |
+| `session.updated` | 杂项信封，一信封多用途（判别靠字段组合）：**压缩生命周期**——`operationId` 前缀 `cmp_*` 且带 `status: "started"/"completed"`（含 `trigger`、`phase: "standalone_turn"`、`preCompactTokenCount`、`boundaryId`、`summaryMessageId`、`postCompactTokenCount`、`truePostCompactTokenCount`）；**压缩边界**——`boundaryId: "compact_*"` 无 status（含 summarized/kept 计数）；**模型调用细节**（querySource/requestHeaders/modelCall）；**常规消息内容镜像**（content + contextWindow）。→ 压缩生命周期映射 `compaction_update`（in_progress/completed；摘要文本与 summaryMessageId 的字段对应未探明，摘要暂不出线），其余不消费 |
+| `session.titleUpdated` / `checkpoint.created` / `streamRecovery.updated` | 元数据 | 暂未消费（titleUpdated 未取得实录夹具，session_info_update 待实现） |
 
 - `v4/telemetry/event`、`process/mcpTelemetry`、`process/resourceSample`、`computer-use/operation-event`：遥测/观测流，不出线到 ACP。
 

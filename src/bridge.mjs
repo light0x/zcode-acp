@@ -14,6 +14,7 @@ import {
   readHistory,
   listCliCommands,
   listCliSkills,
+  paginateSessions,
 } from "./zcode-headless.mjs";
 
 const MODE_VALUES = ["plan", "build", "edit", "yolo", "guarded"];
@@ -332,16 +333,18 @@ export class SessionBridge {
     }
   }
 
-  async list({ cwd }) {
+  async list({ cwd, cursor }) {
     if (!cwd) return { sessions: [] };
     const sessions = await this._listSessions(cwd);
-    // 本连接内创建但尚无 zcode ID 的会话也一并列出（恢复体验完整）
-    for (const [sessionId, st] of this.sessions) {
-      if (sessionId.startsWith("acp_") && st.cwd === cwd && !st.zcodeId) {
-        sessions.unshift({ sessionId, cwd: st.cwd });
+    // 本连接内创建但尚无 zcode ID 的会话在第一页头部列出（恢复体验完整）
+    if (!cursor) {
+      for (const [sessionId, st] of this.sessions) {
+        if (sessionId.startsWith("acp_") && st.cwd === cwd && !st.zcodeId) {
+          sessions.unshift({ sessionId, cwd: st.cwd });
+        }
       }
     }
-    return { sessions };
+    return paginateSessions(sessions, cursor);
   }
 
   async close(sessionId) {

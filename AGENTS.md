@@ -38,6 +38,9 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 8. Zed 的 `@` 文件提及在 `embeddedContext` 关闭时出线为 `resource_link` 块（`file:///` URI + name）。适配器把它解析为 zcode 原生 `file` kind 附件直挂 `localPath`（`sizeBytes` 必填）；目录、不存在或非 `file://` 的引用回落文本提示。用户消息回显分方言：v1 只发文本块（Zed 对已发送 prompt 做乐观渲染，重发图片/提及等非文本块会追加成重复 chip）；v2 按 spec 回显完整 content（按 messageId 对账，不重复）。
 9. 端到端测试发 cancel 用的是带 id 请求，与 Zed 的通知形态不同；改取消链路必须补通知形态用例。
 10. 工具调用的文件目标（`file_path`/`path`/`file` 输入）必须带 `locations`（可含 `line`），Zed 将其解析为可点击的文件位置；缺省时客户端无法打开目标文件。
+11. 权限/提问挂起期间（v2）报 `state_update: requires_action`，应答后 turn 仍在进行才回 `running`（桥接 turn 状态守卫）；v1 方言对非 idle 态不出线，天然抑制。
+12. 压缩生命周期来自 `session/event` 的 `session.updated` 信封（`operationId` 前缀 `cmp_*` + `status`），在 turn 守卫之前分派（自动压缩可能贴近 turn 边界）；摘要文本与 `summaryMessageId` 的字段对应未探明，摘要不出线——探明前不得凭想象补。
+13. `session/list` 游标为不透明 base64url JSON `{offset}`，非法值回落第一页；无头桥接的本地 `acp_*` 会话仅在第一页合并。
 
 ## 测试
 
@@ -68,3 +71,4 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 10. edit/write/read 类工具卡片：目标文件可点击打开（read 定位到对应行）；edit 卡片渲染红绿 diff，同文件多处编辑的标题含 old→new 摘要可区分；标题与输出仍正常展示。
 11. 思考显示开关（Thinking Display）：默认精简——面板无思考流、回复照常；切「完整」后思考实时出线；恢复会话后开关回到默认精简（适配器本地状态，不持久化）。
 12. 上下文容量指示（待 Zed 支持）：适配器每轮结束已按规范发送 `usage_update`（used/size 成对），但当前已发布的 Zed 尚不渲染该通知——输入区无容量表不是适配器缺陷；Zed 实现后验收：容量表随轮次增长，`/compact` 后回落；恢复会话后首轮完成前无指示（turn.completed 才有占用数据）。
+13. 上下文压缩（待 v2 客户端）：`/compact` 后适配器发出 `compaction_update`（in_progress → completed）；已发布 Zed 协商 v1（无此变体）不可见，属预期；v2 客户端应显示压缩标记。

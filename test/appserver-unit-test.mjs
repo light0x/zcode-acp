@@ -549,6 +549,97 @@ async function main() {
     acp.rpc.output.destroy();
   });
 
+  await test("requires_action：权限挂起期间报 requires_action，应答后 turn 仍在则回 running（v2）", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", () => ({
+      session: { sessionId: "sess_ra", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextWindow: 128000 },
+    }));
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    client.handlers.set("session/send", { accepted: true });
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (s, u) => acp.sendUpdate(s, u), log: () => {}, client }),
+      log: () => {},
+    });
+    acp.bridge.onPermissionRequest = (req) => acp.requestPermission(req);
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    const wire = [];
+    clientRpc.on("notification", (m) => { if (m.method === "session/update") wire.push(m.params.update); });
+    const pendingPerm = [];
+    clientRpc.on("request", (m) => { if (m.method === "session/request_permission") pendingPerm.push(m); });
+    await clientRpc.request("initialize", { protocolVersion: 2, capabilities: {} });
+    const sid = (await clientRpc.request("session/new", { cwd: "/w" })).sessionId;
+    acp.bridge.sessions.get(sid).turn = { tools: new Map() }; // 模拟活跃 turn
+    const decisionP = acp.bridge._answerServer("interaction/requestPermission", {
+      sessionId: sid,
+      toolName: "Bash",
+      input: { command: "rm -rf /tmp/x" },
+    });
+    await wait(
+      pendingPerm,
+      (p) => p.length >= 1 && wire.some((u) => u.sessionUpdate === "state_update" && u.state === "requires_action"),
+      "permission request + requires_action",
+    );
+    assert.equal(wire[wire.length - 1].state, "requires_action", "挂起期间最后一条状态应为 requires_action");
+    clientRpc.respond(pendingPerm[0].id, { outcome: { outcome: "selected", optionId: "allow" } });
+    assert.deepEqual(await decisionP, { decision: "allow" }, "应答透传 allow");
+    await wait(wire, (w) => w.some((u) => u.sessionUpdate === "state_update" && u.state === "running"), "running 回落");
+    acp.bridge.sessions.get(sid).turn = null;
+    acp.rpc.output.destroy();
+  });
+
+  await test("压缩：session.updated cmp_* 生命周期 → compaction_update（in_progress/completed），其余杂项不消费", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "go" }] });
+    // 夹具固化自实录流量（/compact turn 的 session/event 流）
+    client.evt(sessionId, "session.updated", {
+      operationId: "cmp_48723e8d",
+      messageId: "msg_c",
+      partId: "part_c",
+      status: "started",
+      trigger: "manual",
+      phase: "standalone_turn",
+      compactReason: "user_requested",
+      display: "separator",
+      preCompactTokenCount: 9849,
+    });
+    client.evt(sessionId, "session.updated", { content: "常规消息内容镜像", querySource: "main_turn" });
+    client.evt(sessionId, "session.updated", {
+      boundaryId: "compact_46ce",
+      trigger: "manual",
+      preCompactTokenCount: 9849,
+      postCompactTokenCount: 26196,
+      truePostCompactTokenCount: 10075,
+      summaryMessageIds: ["msg_s"],
+    });
+    client.evt(sessionId, "session.updated", {
+      operationId: "cmp_48723e8d",
+      status: "completed",
+      boundaryId: "compact_46ce",
+      summaryMessageId: "msg_s",
+      postCompactTokenCount: 26196,
+      endedAt: 1793320665748,
+    });
+    await wait(
+      sent,
+      (s) => s.filter((x) => x.update.sessionUpdate === "compaction_update").length >= 2,
+      "compaction updates",
+    );
+    const updates = sent.filter((x) => x.update.sessionUpdate === "compaction_update").map((x) => x.update);
+    assert.deepEqual(
+      updates.map((u) => [u.compactionId, u.status]),
+      [["cmp_48723e8d", "in_progress"], ["cmp_48723e8d", "completed"]],
+    );
+    client.evt(sessionId, "turn.completed", { status: "success", response: "Compacted", usage: {} });
+    await sleep(20);
+  });
+
   await test("附件：resource_link 本地文件以 file kind + localPath 送达 session/send，回显保留提及块", async () => {
     const { bridge, client, sent } = makeBridge();
     const p = path.join(os.tmpdir(), `zcode-acp-test-${Date.now()}.txt`);
@@ -676,6 +767,23 @@ async function main() {
     });
     assert.deepEqual(r, { action: "accept", content: { answers: { "Which one?": "Option B" } } });
     assert.equal(got[0].options.length, 2);
+    // multiSelect：choices 数组按合法选项回传；非法项过滤、空数组按 cancel 收敛
+    const multi = makeBridge({
+      onElicitation: async () => ({ action: "accept", choices: ["Option A", "Option B", "bogus"] }),
+    });
+    const rm = await multi.bridge._answerServer("interaction/requestUserInput", {
+      sessionId: "sess_1",
+      questions: [{ question: "Pick many?", multiSelect: true, options: [{ label: "Option A" }, { label: "Option B" }] }],
+    });
+    assert.deepEqual(rm, { action: "accept", content: { answers: { "Pick many?": ["Option A", "Option B"] } } });
+    const empty = makeBridge({
+      onElicitation: async () => ({ action: "accept", choices: ["bogus"] }),
+    });
+    const re = await empty.bridge._answerServer("interaction/requestUserInput", {
+      sessionId: "sess_1",
+      questions: [{ question: "Pick?", multiSelect: true, options: [{ label: "Option A" }] }],
+    });
+    assert.equal(re.action, "cancel", "全非法选项按 cancel 收敛");
     const declined = await bridge
       ._answerServer("interaction/requestUserInput", { sessionId: "s", questions: [{ question: "q", options: [{ label: "x" }] }] })
       .catch(() => null);

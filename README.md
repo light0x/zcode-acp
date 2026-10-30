@@ -244,7 +244,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | `session/prompt` | `session/send` 异步受理；`model.streaming` 事件逐字翻译为分块（文本/思考），`turn.completed` 携带 usage 并收束 turn |
 | `session/cancel` | `session/stop`，turn 结束后以 cancelled 收束 |
 | `session/resume`（v1 为 `session/load`） | 协议 `session/resume` 重挂（跨适配器重启亦可）；从头回放经 sqlite 历史翻译为更新流 |
-| `session/list` | 只读查询 sqlite `session` 表（按 cwd 过滤，含标题与更新时间） |
+| `session/list` | 只读查询 sqlite `session` 表（按 cwd 过滤，含标题与更新时间）；v2 游标分页（cursor/nextCursor，页大小 50，非法 cursor 回落第一页） |
 | `session/close` | `session/close` 并释放本地状态 |
 | `session/set_config_option`（v1 为 `session/set_mode`） | `zcode.mode` → `session/setMode`；`zcode.model` / `zcode.reasoning` → `session/setModel`；`zcode.thinking_display` → 适配器本地思考流显示开关；结果回传更新后的配置 |
 | 非法值（`-32602`） | 未知 configId、越界的 model/reasoning 取值 |
@@ -278,10 +278,12 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | plugin / MCP 服务器 | ✅ | app-server 按工作区自动装配 zcode 已启用插件的全部能力（命令、技能、MCP 服务器、hooks）；ACP `session/new` 的 `mcpServers` 透传不适用（未声明该能力） |
 | memory（记忆） | ✅（随 zcode 配置） | zcode 自身读取 `~/.zcode` 记忆库；ACP 协议无 memory 方法，适配器不做干预 |
 | 工具调用展示 | ✅ | 实时状态迁移（pending → in_progress → completed/failed）；标题带语义（命令原文 / 文件路径 + old→new 摘要）；文件目标带 locations 可点击打开；输出文本随完成事件回传；edit/write 的 `structuredPatch` 转 diff 内容块——Zed 渲染红绿 diff，v1 由 git_patch 文本还原 oldText/newText |
-| 图片/音频输入（prompt image/audio 块） | ✅ | 同一通路：app-server 走官方分块上传协议（v4/attachment/begin→chunk→commit）随 session/send 附件发送；无头后端落临时文件经官方 --attach。模型是否按视觉/听觉处理取决于 zcode 侧对该模型+媒体类型的呈现（实测各模型不一，纯色小图可能诱发逐字节解码） |
+| 图片/音频输入（prompt image/audio 块） | ✅ | 同一通路：app-server 走官方分块上传协议（v4/attachment/begin→chunk→commit）随 session/send 附件发送；无头后端落临时文件经官方 --attach。image/audio 能力均已声明（音频上传链实测接受 audio/*）；模型是否实际消费取决于其 `inputFormat.supportsAudio/supportsImage`（实测非听觉模型静默忽略音频附件，turn 正常收束，与 image 在非视觉模型上的行为同口径） |
 | 任务清单（todo） | ✅ | zcode todos → ACP plan 更新（v1 plan／v2 plan_update），create 快照 + turn 后 diff 同步 |
 | 上下文容量指示 | ✅（数据侧） | 每轮结束发 `usage_update`（`used` 实测为当前上下文占用——基线+增量+本轮输出，非计费累计；`size` 取模型 contextWindow；按规范成对发送，缺一不发）。**注意：当前已发布的 Zed 尚未渲染该通知**（源码与更新日志均无此 UI），数据就绪，Zed 实现后自动显示，期间可用 `/compact` 主动压缩上下文 |
-| 提问（AskUserQuestion） | ✅ | app-server interaction/requestUserInput → ACP elicitation/create（form 单选），应答按 question 键回传 answers |
+| 提问（AskUserQuestion） | ✅ | app-server interaction/requestUserInput → ACP elicitation/create（form），应答按 question 键回传 answers；multiSelect 以 array+enum 表单渲染并按选项数组回传（非法选项过滤，空结果按 cancel 收敛） |
+| 等待用户操作状态（requires_action，v2） | ✅ | 权限弹窗/提问挂起期间报 `state_update: requires_action`，应答后 turn 仍在进行则回 `running`（v1 无此状态，方言层抑制） |
+| 上下文压缩（compaction，v2） | ✅ | `/compact` 触发的压缩生命周期（session.updated 的 cmp_* 操作）映射 `compaction_update`（in_progress → completed）；已发布 Zed 走 v1 无此变体，v2 客户端可显示压缩标记；摘要文本的字段对应未探明，暂不出线 |
 | 会话历史（v1） | ✅ | v1 session/list＋session/close 路由并声明 sessionCapabilities；Zed 历史浏览器可用 |
 
 ## 测试

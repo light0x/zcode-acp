@@ -90,10 +90,11 @@ export class AcpAgent {
     return {
       protocolVersion: PROTOCOL_VERSION,
       // 无头后端按 turn 起进程，无 MCP 透传通道，只声明基线会话能力；
-      // prompt.image：两个后端均支持图片（app-server 附件上传 / headless --attach）
+      // prompt.image/audio：两个后端均支持（app-server 附件上传 / headless --attach），
+      // 模型是否实际消费取决于其 inputFormat（同 image 在非视觉模型上的行为）
       capabilities: {
         session: {
-          prompt: { image: {} },
+          prompt: { image: {}, audio: {} },
         },
       },
       info: { ...AGENT_INFO },
@@ -134,29 +135,39 @@ export class AcpAgent {
 
   // 桥接层的单选提问（app-server interaction/requestUserInput）→ ACP 表单式 elicitation，
   // 应答映射回 {action, answers}。客户端无响应/超时按 cancel 收敛。
-  async requestElicitation({ sessionId, message, options }) {
-    const labels = (options ?? []).map((o) => o.label).filter(Boolean);
+  // 挂起期间按 v2 规范报 requires_action，应答后 turn 仍在进行则回 running（v1 方言抑制非 idle 态）。
+  async requestElicitation(req) {
+    const { sessionId } = req;
+    const labels = (req.options ?? []).map((o) => o.label).filter(Boolean);
     if (!labels.length) return { action: "cancel" };
+    // multiSelect：array + items.enum 表单（客户端按多选渲染）；单选为 string enum
+    const choiceSchema = req.multiSelect
+      ? { type: "array", items: { type: "string", enum: labels }, uniqueItems: true }
+      : { type: "string", enum: labels };
     const params = {
       sessionId,
       mode: "form",
-      message: message || "Choose an option",
+      message: req.message || "Choose an option",
       requestedSchema: {
         type: "object",
-        properties: {
-          choice: { type: "string", enum: labels },
-        },
+        properties: { choice: choiceSchema },
         required: ["choice"],
       },
     };
+    this.sendUpdate(sessionId, { sessionUpdate: "state_update", state: "requires_action" });
     const answer = await Promise.race([
       this.rpc.request("elicitation/create", params).catch(() => null),
       new Promise((resolve) => setTimeout(() => resolve(null), 180000)),
     ]);
+    this._resumeRunning(sessionId);
     if (!answer || answer.action !== "accept") {
       return { action: answer?.action === "decline" ? "decline" : "cancel" };
     }
     const choice = answer.content?.choice;
+    if (req.multiSelect) {
+      const arr = (Array.isArray(choice) ? choice : typeof choice === "string" ? [choice] : []).filter((v) => labels.includes(v));
+      return arr.length ? { action: "accept", choices: arr } : { action: "cancel" };
+    }
     if (typeof choice !== "string" || !labels.includes(choice)) return { action: "cancel" };
     return { action: "accept", choice };
   }
@@ -189,13 +200,22 @@ export class AcpAgent {
             ...(reason ? { description: reason } : {}),
             subject: { type: "tool_call", toolCallUpdate: toolCall },
           };
+    this.sendUpdate(sessionId, { sessionUpdate: "state_update", state: "requires_action" });
     const answer = await Promise.race([
       this.rpc.request("session/request_permission", params).catch(() => null),
       new Promise((resolve) => setTimeout(() => resolve(null), 180000)),
     ]);
+    this._resumeRunning(sessionId);
     const outcome = answer?.outcome;
     if (outcome?.outcome !== "selected") return "deny";
     return outcome.optionId === "allow" ? "allow" : "deny";
+  }
+
+  // requires_action 收束后的状态回落：turn 仍在进行才报 running（等待期间 turn 被取消则不发）
+  _resumeRunning(sessionId) {
+    const st = this.bridge?.sessions?.get?.(sessionId);
+    if (!st || st.turn === null || st.turn === undefined) return;
+    this.sendUpdate(sessionId, { sessionUpdate: "state_update", state: "running" });
   }
 }
 

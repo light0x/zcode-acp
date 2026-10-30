@@ -273,6 +273,24 @@ async function main() {
     );
   });
 
+  await test("list 分页：cursor/nextCursor 翻页，非法 cursor 回落第一页，本地会话仅在第一页", async () => {
+    const many = Array.from({ length: 120 }, (_, i) => ({ sessionId: `sess_p${i}`, cwd: "/w" }));
+    const { bridge } = makeBridge({ listSessions: async () => many });
+    const p1 = await bridge.list({ cwd: "/w" });
+    assert.equal(p1.sessions.length, 50);
+    assert.equal(p1.sessions[0].sessionId, "sess_p0");
+    assert.ok(p1.nextCursor, "还有后续页应带 nextCursor");
+    const p2 = await bridge.list({ cwd: "/w", cursor: p1.nextCursor });
+    assert.equal(p2.sessions[0].sessionId, "sess_p50");
+    const p3 = await bridge.list({ cwd: "/w", cursor: p2.nextCursor });
+    assert.equal(p3.sessions.length, 20);
+    assert.equal(p3.nextCursor, undefined, "末页无 nextCursor");
+    const bad = await bridge.list({ cwd: "/w", cursor: "!!!not-base64!!!" });
+    assert.equal(bad.sessions[0].sessionId, "sess_p0", "非法 cursor 回落第一页");
+    const past = await bridge.list({ cwd: "/w", cursor: Buffer.from(JSON.stringify({ offset: 500 })).toString("base64url") });
+    assert.deepEqual(past, { sessions: [] }, "越界页返回空且无 nextCursor");
+  });
+
   await test("close：清空会话状态", async () => {
     const { bridge } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });

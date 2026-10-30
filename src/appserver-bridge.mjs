@@ -16,6 +16,7 @@ import {
   listCliSkills,
   getSessionModelSelection,
   resolveZcodeBin,
+  paginateSessions,
 } from "./zcode-headless.mjs";
 import { AppServerClient } from "./appserver-client.mjs";
 
@@ -256,9 +257,10 @@ export class AppServerBridge {
     };
   }
 
-  async list({ cwd }) {    if (!cwd) return { sessions: [] };
+  async list({ cwd, cursor }) {
+    if (!cwd) return { sessions: [] };
     const sessions = await this._listSessions(cwd);
-    return { sessions };
+    return paginateSessions(sessions, cursor);
   }
 
   async close(sessionId) {
@@ -543,10 +545,17 @@ export class AppServerBridge {
     }
     if (msg.method !== "session/event") return;
     const ev = msg.params ?? {};
-    const st = this.sessions.get(ev.sessionId);
-    if (!st || !st.turn) return;
     const kind = ev.type ?? ev.kind ?? "?";
     const payload = ev.payload ?? {};
+    // session.updated 是杂项信封（压缩生命周期、模型调用细节、消息内容镜像），
+    // 在 turn 守卫之前处理：自动压缩可能在 turn 边界附近出线
+    if (kind === "session.updated") {
+      const st = this.sessions.get(ev.sessionId);
+      if (st) this._onSessionUpdated(st, payload);
+      return;
+    }
+    const st = this.sessions.get(ev.sessionId);
+    if (!st || !st.turn) return;
     if (kind === "model.streaming") return this._onStreaming(st, payload);
     if (kind === "tool.updated") return this._onTool(st, payload);
     if (kind === "turn.completed") {
@@ -569,6 +578,27 @@ export class AppServerBridge {
       this._endTurn(st.sessionId, {
         stopReason: "error",
         error: { code: -32603, message: payload.error ?? payload.reason ?? `turn ${kind}` },
+      });
+    }
+  }
+
+  // session.updated → ACP：仅消费压缩生命周期（operationId 前缀 cmp_，实测 trigger=manual，
+  // status started/completed；boundary 事件与摘要内容镜像的字段对应未探明，不臆造——摘要暂不出线）。
+  // 其余 payload（模型调用细节、常规消息内容）不消费。
+  _onSessionUpdated(st, payload) {
+    const opId = typeof payload?.operationId === "string" ? payload.operationId : null;
+    if (!opId || !opId.startsWith("cmp_")) return;
+    if (payload.status === "started") {
+      this._update(st.sessionId, {
+        sessionUpdate: "compaction_update",
+        compactionId: opId,
+        status: "in_progress",
+      });
+    } else if (payload.status === "completed") {
+      this._update(st.sessionId, {
+        sessionUpdate: "compaction_update",
+        compactionId: opId,
+        status: "completed",
       });
     }
   }
@@ -667,24 +697,35 @@ export class AppServerBridge {
       return { headersApplied: false };
     }
     if (method === "interaction/requestUserInput") {
-      // zcode AskUserQuestion 等提问 → ACP elicitation；answers 按 question 文本为键
+      // zcode AskUserQuestion 等提问 → ACP elicitation；answers 按 question 文本为键，
+      // multiSelect 以合法选项数组回传（客户端表单按 array+enum 渲染多选）
       const question = params?.questions?.[0];
       if (!question?.question) return { action: "cancel", reason: "no question" };
       if (!this.onElicitation) return { action: "cancel", reason: "no elicitation client" };
+      const options = (question.options ?? []).map((o) => ({ label: o.label ?? o.value, description: o.description }));
+      const labels = options.map((o) => o.label).filter(Boolean);
+      const multi = !!question.multiSelect;
       const r = await Promise.resolve(
         this.onElicitation({
           sessionId: params?.sessionId,
           message: [question.header, question.question].filter(Boolean).join("："),
-          options: (question.options ?? []).map((o) => ({ label: o.label ?? o.value, description: o.description })),
+          options,
+          ...(multi ? { multiSelect: true } : {}),
         }),
       ).catch(() => null);
-      if (!r || r.action !== "accept" || typeof r.choice !== "string") {
+      let value = null;
+      if (r?.action === "accept") {
+        if (multi) {
+          const arr = (Array.isArray(r.choices) ? r.choices : typeof r.choice === "string" ? [r.choice] : []).filter((v) => labels.includes(v));
+          if (arr.length) value = arr;
+        } else if (typeof r.choice === "string" && labels.includes(r.choice)) {
+          value = r.choice;
+        }
+      }
+      if (value === null) {
         return { action: r?.action === "decline" ? "decline" : "cancel" };
       }
-      const answers = question.multiSelect
-        ? { [question.question]: [r.choice] }
-        : { [question.question]: r.choice };
-      return { action: "accept", content: { answers } };
+      return { action: "accept", content: { answers: { [question.question]: value } } };
     }
     if (method === "interaction/requestOfficialMcpAuthHeaders") {
       return {};

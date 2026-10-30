@@ -82,6 +82,7 @@ async function main() {
     const r = await initV1(client, 1);
     assert.equal(r.protocolVersion, 1);
     assert.equal(r.agentCapabilities.loadSession, true);
+    assert.deepEqual(r.agentCapabilities.promptCapabilities, { image: true, audio: true, embeddedContext: false }, "音频上传链实测可用，与 image 同口径声明");
     assert.ok(r.agentInfo?.name === "zcode-acp" && typeof r.agentInfo.version === "string");
     assert.deepEqual(r.authMethods, []);
     assert.equal(r.capabilities, undefined);
@@ -93,6 +94,7 @@ async function main() {
       const r = await withTimeout(client.request("initialize", { protocolVersion: 2, capabilities: {} }), "init2");
       assert.equal(r.protocolVersion, 2);
       assert.ok(r.capabilities?.session && r.info?.name === "zcode-acp");
+      assert.deepEqual(r.capabilities.session.prompt, { image: {}, audio: {} }, "v2 音频能力与 image 同口径声明");
       assert.equal(r.agentCapabilities, undefined);
       acp.rpc.output.destroy();
     }

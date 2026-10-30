@@ -15,6 +15,7 @@ export class AcpAgent {
     this.initialized = false;
     this.version = null; // 协商后的协议版本：1 或 2
     this.clientCapabilities = {};
+    this._livePerm = new Map(); // 权限请求合并表：key `${sessionId}:${toolCallId}` → 在途等待者
     this.v1 = new V1Dialect({ agent: this, bridge, log, info: AGENT_INFO });
 
     this.rpc.on("request", (msg) => {
@@ -173,8 +174,12 @@ export class AcpAgent {
   }
 
   // 桥接层的权限请求 → ACP 客户端（Zed 权限弹窗），应答映射回 allow/deny。
-  // 客户端无响应或取消时按 deny 收敛（安全默认）。
-  async requestPermission({ sessionId, toolCallId, toolName, riskLevel, reason, input }) {
+  // 服务端预制选项（allow_once/allow_project/deny，各自携带应答载荷）优先透传，
+  // 「Always allow」经 permissionUpdates 在 zcode 侧落地为项目级持久规则；
+  // 缺失时合成 Allow/Deny 兜底。客户端无响应或取消时按 deny 收敛（安全默认）。
+  // app-server 对未应答的权限反向请求约 5s 超时后以相同 requestId 重发：同一逻辑请求
+  // 合并为一次客户端弹窗，应答广播给所有在途的服务端等待者（旧请求已超时，应答被服务端忽略）。
+  async requestPermission({ sessionId, toolCallId, toolName, riskLevel, reason, input, serverOptions }) {
     const toolCall = {
       toolCallId: toolCallId ?? `perm_${Date.now()}`,
       title: deriveToolTitle(toolName, input),
@@ -182,10 +187,44 @@ export class AcpAgent {
       status: "in_progress",
       ...(input !== undefined ? { rawInput: input } : {}),
     };
-    const options = [
-      { optionId: "allow", name: "Allow", kind: "allow_once" },
-      { optionId: "deny", name: "Deny", kind: "reject_once" },
-    ];
+    const permKey = `${sessionId}:${toolCall.toolCallId}`;
+    const live = this._livePerm.get(permKey);
+    if (live) return new Promise((resolve) => live.waiters.push(resolve));
+    const state = { waiters: [] };
+    this._livePerm.set(permKey, state);
+    let outcome;
+    try {
+      outcome = await this._askPermission({ sessionId, toolCall, toolName, reason, input, serverOptions });
+    } finally {
+      this._livePerm.delete(permKey);
+    }
+    for (const w of state.waiters) w(outcome);
+    return outcome;
+  }
+
+  async _askPermission({ sessionId, toolCall, toolName, reason, input, serverOptions }) {
+    // zcode option kind → ACP kind（deny 无 ACP 对应拒绝「仅本次」之外语义，统一 reject_once）；
+    // 未知 kind 按规范原样透传（自定义 kind 以 _ 开头），客户端按通用样式渲染
+    const KIND_MAP = { allow_once: "allow_once", allow_always: "allow_always", deny: "reject_once" };
+    const fromServer = (Array.isArray(serverOptions) ? serverOptions : [])
+      .filter((o) => typeof o?.optionId === "string" && o.optionId)
+      .map((o) => ({
+        optionId: o.optionId,
+        name: typeof o.name === "string" && o.name ? o.name : o.optionId,
+        kind: KIND_MAP[o.kind] ?? (typeof o.kind === "string" && o.kind ? o.kind : "allow_once"),
+      }));
+    const options = fromServer.length
+      ? fromServer
+      : [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "deny", name: "Deny", kind: "reject_once" },
+        ];
+    let subject = { type: "tool_call", toolCall };
+    // v2 规范的 command 主体：Bash 类命令权限展示原始命令与工作目录
+    const cwd = this.bridge?.sessions?.get?.(sessionId)?.cwd;
+    if (typeof input?.command === "string" && input.command && typeof cwd === "string" && cwd) {
+      subject = { type: "command", command: input.command, cwd, toolCallId: toolCall.toolCallId };
+    }
     const params =
       this.version === 1
         ? {
@@ -198,7 +237,7 @@ export class AcpAgent {
             options,
             title: toolName ?? "tool",
             ...(reason ? { description: reason } : {}),
-            subject: { type: "tool_call", toolCallUpdate: toolCall },
+            subject,
           };
     this.sendUpdate(sessionId, { sessionUpdate: "state_update", state: "requires_action" });
     const answer = await Promise.race([
@@ -208,6 +247,8 @@ export class AcpAgent {
     this._resumeRunning(sessionId);
     const outcome = answer?.outcome;
     if (outcome?.outcome !== "selected") return "deny";
+    const sel = fromServer.length ? serverOptions.find((o) => o?.optionId === outcome.optionId) : null;
+    if (sel?.response) return sel.response;
     return outcome.optionId === "allow" ? "allow" : "deny";
   }
 

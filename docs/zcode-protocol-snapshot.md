@@ -17,14 +17,14 @@
 
 | 方法 | 参数 | 结果 | 备注 |
 | --- | --- | --- | --- |
-| `session/create` | `{workspace: {workspacePath, workspaceKey}}` | `{session: {sessionId, mode, model: {providerId, modelId, options?}}, projection: {contextWindow, mode, status, …}, protocol}` | sessionKind/title 不是 create 参数 |
+| `session/create` | `{workspace: {workspacePath, workspaceKey}}` | `{session: {sessionId, mode, model: {providerId, modelId, options?}}, projection: {contextWindow, mode, status, …}, protocol}` | sessionKind/title 不是 create 参数；`projection` 另含 `contextUsed`/`totalTokenCount`（实测即当前上下文占用，与上轮 `turn.completed.usage.totalTokens` 一致）——resume 响应同形携带，可用于恢复会话立即出线 usage_update |
 | `session/subscribe` | `{sessionId, deliveryKind: "desktop-continuous" \| "web-remote-replayable"}` | `{}` | 订阅后才开始收 `session/event` |
 | `session/send` | `{sessionId, content: string}` | `{accepted: true, sessionId, stateRevision}` | 异步受理；turn 事件随后推送 |
 | `session/stop` | `{sessionId}` | `{}` | 取消当前 turn |
 | `session/setMode` | `{sessionId, mode: "build"\|"edit"\|"plan"\|"yolo"\|"guarded"}` | 投影 | yolo 下不再产生权限请求 |
 | `session/setModel` | `{sessionId, model: {providerId, modelId, options?: {reasoningLevel}}}` | 投影 | 模型带 reasoning.levels 时该档位必填；不支持 `ref` 包装 |
 | `session/setThoughtLevel` | `{sessionId, thoughtLevel}` | 投影 | 单独设思考档位 |
-| `session/resume` | `{sessionId, workspace?}` | `{messages: [...]}` | 可跨进程重挂已持久化会话，响应自带历史 |
+| `session/resume` | `{sessionId, workspace?}` | `{messages: [...], session: {mode, model}, projection, runtime, settings, slashCommands}` | 可跨进程重挂已持久化会话，响应自带历史；**不回填持久化模式**——换进程后 `session.mode`/`projection.mode` 恒为默认 build（实测），模式持久化在 sqlite `session_entry` 的 `runtime/execution_state`（`{"mode":"edit","planEnabled":false}`，setMode 时落盘），客户端须自行读取并 `session/setMode` 恢复。**占用来源**：`runtime.contextUsage.{used,size}` 权威（压缩会话跨进程 resume 仍有正确值）；`projection.contextUsed` 在压缩会话换进程后恒为 0（实测，未压缩会话正常），不可单独依赖 |
 | `session/read` / `session/messages` | `{sessionId}` | `{messages: [...]}` | 历史读取 |
 | `session/list` | `{}` | `{sessions: [{sessionId, mode, status, title, sessionKind, updatedAt, …}]}` | |
 | `session/usage` | `{sessionId}` | `{totalTokens, inputTokens, outputTokens, reasoningTokens, cacheCreationTokens, cacheReadTokens, modelRequestCount, modelErrorCount, inputBaselineBySource}` | **计费累计统计**：totalTokens 是累计消耗而非当前上下文占用，不可用作 usage_update.used |
@@ -36,7 +36,7 @@
 | 方法 | 参数 | 应答 |
 | --- | --- | --- |
 | `session/requestRuntimePreferences` | `{sessionId, scope: "runtime-materialization" \| "user-execution"}` | `{nativeSearchEnhancementsEnabled: boolean}`（建会话与每次 send 前各一次） |
-| `interaction/requestPermission` | `{sessionId, requestId, toolCallId?, toolName, riskLevel, reason, input}` | `{decision: "allow" \| "deny" \| "escalate" \| "modify"}`；应答非法时服务端换 requestId 重问 |
+| `interaction/requestPermission` | `{sessionId, requestId, toolName, riskLevel, reason, input, options[]}`（实录无 toolCallId；`riskLevel` 实测 `medium`/`high`，reason 实测「Tool has side effects and requires approval」/「High risk tools require explicit approval」；`options[]` 各项 `{kind: allow_once\|allow_always\|deny, name, optionId, description?, response}`，`response` 为该选项的预制应答载荷——`allow_project`（allow_always）携带 `{decision:"allow", permissionUpdates:[{behavior:"allow", rules:[{toolName, ruleContent}], type:"addRules"}]}`，客户端选中后须原样回传以落地项目级持久规则） | `{decision: "allow" \| "deny" \| "escalate" \| "modify", permissionUpdates?}`；**未应答约 5s 超时后以相同 requestId 重发**（重发参数逐字节相同）；对已超时请求的迟到应答被服务端忽略（实测 allow 迟到无副作用）；应答非法时换 requestId 重问 |
 | `interaction/requestOfficialMcpAuthHeaders` | `{mcpKey, pluginId, targetOrigin, workspace, …}` | 回 `{}` 可继续（正确形状待补） |
 
 ## 通知
@@ -55,14 +55,15 @@
 | `model.streaming` | `{assistantMessageId, delta, done, kind}`；kind 实测 `text_delta`/`reasoning_delta`/`tool_input_start`/`tool_input_delta`/`tool_call`（tool_call 携带完整 input） | `text_delta` → `agent_message_chunk`；`reasoning_delta` → `agent_thought_chunk`（受 `zcode.thinking_display` 开关控制，默认 concise 不出线）；`tool_call` → 输入留档供 `tool.updated` 剥离 input 时回填 |
 | `tool.updated` | `kind` 实测 `scheduled`/`started`/`result`/`batch`；result 载荷 `{success, content, display: {kind: "file_diff", filePath, additions, deletions, structuredPatch: [{oldStart, oldLines, newStart, newLines, lines: [" "/"-"/"+" 前缀行"]}], truncated}, perf, truncated}`（**没有 `output` 字段**）；scheduled 常带 `inputOmitted: true, inputRef: "model_stream"` | → `tool_call_update`（pending/in_progress/completed；content 文本 → rawOutput，structuredPatch → diff 内容块） |
 | `permission.requested` / `permission.resolved` | requestId, toolName, riskLevel, input | 与反向请求并存，zcode-acp 以反向请求为准 |
-| `turn.completed` | response, tokenCount, usage{totalTokens, …}, toolCallCount；usage.totalTokens 实测 ≈ 当前上下文占用（基线 + 增量 + 本轮输出；两轮实测 22118 → 23358），非跨轮计费累计 | → `usage_update`（Zed 上下文容量表的数据源）+ `state_update idle`（stopReason 按取消/状态映射） |
-| `session.updated` | 杂项信封，一信封多用途（判别靠字段组合）：**压缩生命周期**——`operationId` 前缀 `cmp_*` 且带 `status: "started"/"completed"`（含 `trigger`、`phase: "standalone_turn"`、`preCompactTokenCount`、`boundaryId`、`summaryMessageId`、`postCompactTokenCount`、`truePostCompactTokenCount`）；**压缩边界**——`boundaryId: "compact_*"` 无 status（含 summarized/kept 计数）；**模型调用细节**（querySource/requestHeaders/modelCall）；**常规消息内容镜像**（content + contextWindow）。→ 压缩生命周期映射 `compaction_update`（in_progress/completed；摘要文本与 summaryMessageId 的字段对应未探明，摘要暂不出线），其余不消费 |
+| `turn.completed` | response, tokenCount, usage{totalTokens, modelRequestCount, …}, toolCallCount；**usage 是全轮累计计费口径**（Σ各次模型请求的 input+output；带工具轮多次往返，实测 3 次往返累计 67964 vs 终态占用 22841——`modelRequestCount` 即往返次数）；仅无工具单请求轮（modelRequestCount=1）累计才近似占用 | → `state_update idle`（stopReason 按取消/状态映射）+ `usage_update`（used 取信封末次 per-iteration 的 input+output，缺信封时仅单请求轮回退累计值） |
+| `session.updated` | 杂项信封，一信封多用途（判别靠字段组合）：**压缩生命周期**——`operationId` 前缀 `cmp_*` 且带 `status: "started"/"completed"`（含 `trigger`、`phase: "standalone_turn"`、`preCompactTokenCount`、`boundaryId`、`summaryMessageId`、`postCompactTokenCount`、`truePostCompactTokenCount`）；**压缩边界**——`boundaryId: "compact_*"` 无 status（含 summarized/kept 计数）；**主 turn 单次模型调用**——`querySource: "main_turn"` 且带 `usage{inputTokens, outputTokens, …}` 与 `stopReason`（实测逐次 input 22136→22561→22772，末次 input+output=22841 ≈ 终态占用，与 resume 的 `projection.contextUsed` 同源）；**常规消息内容镜像**（content + contextWindow——该 contextWindow 实测 1000000 与目录/投影的 200000 不一致，语义未明，不消费）。→ 压缩生命周期映射 `compaction_update`（in_progress/completed；摘要文本与 summaryMessageId 的字段对应未探明，摘要暂不出线）；per-iteration usage 留档作 usage_update 的 used 来源，其余不消费 |
 | `session.titleUpdated` / `checkpoint.created` / `streamRecovery.updated` | 元数据 | 暂未消费（titleUpdated 未取得实录夹具，session_info_update 待实现） |
 
 - `v4/telemetry/event`、`process/mcpTelemetry`、`process/resourceSample`、`computer-use/operation-event`：遥测/观测流，不出线到 ACP。
 
 ## 行为注记
 
+- 权限门控随会话模式（`state.updated` 补丁 `permission.mode` 镜像会话 mode；实测矩阵，victim 操作为 Write 建文件＝medium 与 Bash `rm` 删文件＝high）：**yolo / guarded 不门控任何操作**（guarded 名实不符，连 Bash 删除都自动放行）；**build 门控 medium 与 high**（Write、Bash rm 均逐次询问，同会话第二笔同类操作再次询问，无会话级记忆）；**edit 门控 high**（Bash rm 询问；Write 未测）；plan 未测（只读规划）。适配器默认跟随 zcode 会话默认 build，即开箱弹权限审批。
 - 插件 MCP（内置 documents/presentations/spreadsheets/pdf/node_repl、用户与插件级 MCP）由 app-server 按工作区自动装配，无需客户端干预。
 - 会话持久化与桌面端共享同一 sqlite 存储：适配器 `session/list` 与历史回放继续走只读 sqlite
   （`~/.zcode/cli/db/db.sqlite`），`session/resume` 走协议重挂。

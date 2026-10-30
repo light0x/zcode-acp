@@ -158,7 +158,7 @@ async function main() {
     const mode = r.configOptions[0];
     assert.equal(mode.type, "select");
     assert.equal(mode.category, "mode");
-    assert.equal(mode.currentValue, "yolo");
+    assert.equal(mode.currentValue, "build", "未显式指定模式时跟随 zcode 会话默认（build，写操作走权限审批）");
     assert.deepEqual(mode.options.map((o) => o.value), ["plan", "build", "edit", "yolo", "guarded"]);
     const model = r.configOptions[1];
     assert.equal(model.category, "model");
@@ -167,10 +167,16 @@ async function main() {
     const reasoning = r.configOptions[2];
     assert.equal(reasoning.currentValue, undefined);
     assert.deepEqual(reasoning.options.map((o) => o.value), ["disabled", "low", "high"]);
-    // yolo 默认 + 订阅已发生
-    assert.ok(client.requests.some((r) => r.method === "session/setMode" && r.params.mode === "yolo"));
+    // 跟随服务端默认模式时不额外 setMode；订阅已发生
+    assert.ok(!client.requests.some((r) => r.method === "session/setMode"), "无需强制切模式");
     assert.ok(client.requests.some((r) => r.method === "session/subscribe"));
     assert.ok(kindsOf(sent).every((k) => k === undefined || true));
+  });
+
+  await test("createNew：客户端显式传模式时同步到 zcode（yolo 全自动放行）", async () => {
+    const { bridge, client } = makeBridge();
+    await bridge.createNew({ cwd: "/w", mode: "yolo" });
+    assert.ok(client.requests.some((r) => r.method === "session/setMode" && r.params.mode === "yolo"));
   });
 
   await test("prompt：user_message + send 透传 content", async () => {
@@ -194,7 +200,7 @@ async function main() {
     client.evt(sessionId, "turn.completed", {
       status: "success",
       response: "Hello",
-      usage: { totalTokens: 99 },
+      usage: { totalTokens: 99, modelRequestCount: 1 },
     });
     await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update"), "idle");
     const chunks = sent.filter((x) => x.update.sessionUpdate === "agent_message_chunk");
@@ -260,6 +266,125 @@ async function main() {
     client.evt(sessionId, "turn.completed", { status: "success", response: "ok", usage: { totalTokens: 42 } });
     await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update" && x.update.state === "idle"), "idle");
     assert.ok(!sent.some((x) => x.update.sessionUpdate === "usage_update"), "缺 size 时不应发 usage_update");
+  });
+
+  await test("usage_update：恢复会话从 resume 响应重建 contextWindow（projection 权威，目录兜底）", async () => {
+    // 回归钉住：resume 的新会话状态 contextWindow 为 null，_attach 不恢复会导致
+    // 整个恢复会话期间 usage_update 静默停发（used/size 成对校验），客户端用量图标消失
+    const { bridge, client, sent } = makeBridge();
+    client.handlers.set("session/resume", () => ({
+      messages: [],
+      session: { sessionId: "sess_old", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      // projection 报 96000（实测可回落为与模型不符的默认值），目录条目 model-x=128000 应胜出
+      projection: { contextWindow: 96000, contextUsed: 5100 },
+      settings: { model: { available: CATALOG } },
+    }));
+    bridge._readHistory = async () => [];
+    await bridge.resume({ sessionId: "sess_old", cwd: "/w" });
+    assert.equal(bridge.sessions.get("sess_old").contextWindow, 128000, "size 应取模型目录条目（projection 的 96000 不覆盖）");
+    // 恢复即出线 usage_update（projection.contextUsed 实测为当前上下文占用），无需等首轮
+    const ru = sent.find((x) => x.update.sessionUpdate === "usage_update");
+    assert.ok(ru, "resume 后应立即出线 usage_update");
+    assert.deepEqual([ru.update.used, ru.update.size], [5100, 128000]);
+    await bridge.prompt({ sessionId: "sess_old", blocks: [{ type: "text", text: "hi" }] });
+    client.evt("sess_old", "turn.completed", { status: "success", response: "ok", usage: { totalTokens: 42, modelRequestCount: 1 } });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "usage_update" && x.update.used === 42), "turn usage_update");
+    const u = sent.find((x) => x.update.sessionUpdate === "usage_update" && x.update.used === 42);
+    assert.deepEqual([u.update.used, u.update.size], [42, 128000]);
+  });
+
+  await test("usage_update：压缩会话 resume 以 runtime.contextUsage 为准（projection.contextUsed 恒 0，实录）", async () => {
+    const { bridge, client, sent } = makeBridge();
+    // 夹具固化自实录流量（/compact 后跨进程 resume：projection.contextUsed=0，runtime.contextUsage 仍有正确占用）
+    client.handlers.set("session/resume", () => ({
+      messages: [],
+      session: { sessionId: "sess_cw", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextUsed: 0, contextWindow: 200000, mode: "build", status: "idle", totalTokenCount: 0, turnCount: 0 },
+      runtime: {
+        eventSeq: 2,
+        pendingRequestIds: [],
+        contextUsage: { cache: { inputTokens: 23084, cacheReadTokens: 16896 }, cost: null, size: 200000, used: 23118 },
+      },
+      settings: { model: { available: CATALOG } },
+    }));
+    bridge._readHistory = async () => [];
+    bridge._getExecutionMode = async () => null;
+    await bridge.resume({ sessionId: "sess_cw", cwd: "/w" });
+    const u = sent.find((x) => x.update.sessionUpdate === "usage_update");
+    assert.ok(u, "runtime.contextUsage 有值时应出线");
+    assert.deepEqual([u.update.used, u.update.size], [23118, 128000], "size 取目录条目（projection/cu.size 的 200000 为与模型不符的回落值）");
+
+    // 两个来源均为 0（无可信占用）：宁缺毋滥不发
+    const client2 = new FakeClient();
+    client2.handlers.set("session/create", () => ({}));
+    client2.handlers.set("session/subscribe", {});
+    client2.handlers.set("session/resume", () => ({
+      messages: [],
+      session: { sessionId: "sess_z", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextUsed: 0, contextWindow: 200000 },
+      settings: { model: { available: CATALOG } },
+    }));
+    const sent2 = [];
+    const bridge2 = new AppServerBridge({ sendUpdate: (s, u2) => sent2.push({ sessionId: s, update: u2 }), log: () => {}, client: client2 });
+    bridge2._readHistory = async () => [];
+    bridge2._listCliCommands = async () => ({ commands: [] });
+    bridge2._listCliSkills = async () => ({ skills: [] });
+    bridge2._getExecutionMode = async () => null;
+    await bridge2.resume({ sessionId: "sess_z", cwd: "/w" });
+    assert.ok(!sent2.some((x) => x.update.sessionUpdate === "usage_update"), "占用为 0 不应出线");
+  });
+
+  await test("usage_update：create 无 projection 时以目录条目兜底 size", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", () => {
+      client.state({ model: { available: CATALOG } });
+      return {
+        session: { sessionId: "sess_np", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+        settings: { model: { available: CATALOG } },
+      };
+    });
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    client.handlers.set("session/send", { accepted: true });
+    const sent = [];
+    const bridge = new AppServerBridge({ sendUpdate: (s, u) => sent.push({ sessionId: s, update: u }), log: () => {}, client });
+    bridge._listCliCommands = async () => ({ commands: [] });
+    bridge._listCliSkills = async () => ({ skills: [] });
+    bridge._readHistory = async () => [];
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    assert.equal(bridge.sessions.get(sessionId).contextWindow, 128000, "目录条目 contextWindow 兜底");
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "hi" }] });
+    client.evt(sessionId, "turn.completed", { status: "success", response: "ok", usage: { totalTokens: 7, modelRequestCount: 1 } });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "usage_update"), "usage_update");
+    const u = sent.find((x) => x.update.sessionUpdate === "usage_update");
+    assert.deepEqual([u.update.used, u.update.size], [7, 128000]);
+  });
+
+  await test("usage_update：带工具轮取末次信封 input+output（turn.completed 累计口径不可用）", async () => {
+    // 夹具固化自实录流量（build 模式 Bash rm 轮：3 次模型往返，信封 per-iteration usage
+    // 与 turn.completed 的累计 usage 并存；累计 67964 vs 真实终态占用 22841）
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "delete it" }] });
+    client.evt(sessionId, "session.updated", { content: "I'll check the target first.", contextWindow: 1000000, querySource: "main_turn", stopReason: "tool-calls", usage: { inputTokens: 22136, outputTokens: 303, totalTokens: 22439, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    client.evt(sessionId, "session.updated", { content: "Matching the described target.", contextWindow: 1000000, querySource: "main_turn", stopReason: "tool-calls", usage: { inputTokens: 22561, outputTokens: 123, totalTokens: 22684, cacheReadTokens: 22400, cacheWriteTokens: 0 } });
+    client.evt(sessionId, "session.updated", { content: "Deleted.", contextWindow: 1000000, querySource: "main_turn", stopReason: "stop", usage: { inputTokens: 22772, outputTokens: 69, totalTokens: 22841, cacheReadTokens: 22528, cacheWriteTokens: 0 } });
+    client.evt(sessionId, "turn.completed", {
+      status: "success",
+      response: "Deleted.",
+      usage: { source: "provider", modelRequestCount: 3, inputTokens: 67469, outputTokens: 495, totalTokens: 67964, cacheReadTokens: 44928 },
+    });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "usage_update"), "usage_update");
+    const u = sent.find((x) => x.update.sessionUpdate === "usage_update");
+    assert.deepEqual([u.update.used, u.update.size], [22841, 128000], "used 应为末次 input+output 而非累计 67964");
+
+    // 多请求轮且无信封（异常路径）：占用未知，宁缺毋滥不发
+    const { bridge: b2, client: c2, sent: s2 } = makeBridge();
+    const r2 = await b2.createNew({ cwd: "/w" });
+    await b2.prompt({ sessionId: r2.sessionId, blocks: [{ type: "text", text: "go" }] });
+    c2.evt(r2.sessionId, "turn.completed", { status: "success", response: "ok", usage: { modelRequestCount: 3, totalTokens: 67964 } });
+    await wait(s2, (s) => s.some((x) => x.update.sessionUpdate === "state_update"), "idle");
+    assert.ok(!s2.some((x) => x.update.sessionUpdate === "usage_update"), "多请求无信封不应发 usage_update");
   });
 
   await test("兜底：无流式分块时以 turn.completed.response 整段送达", async () => {
@@ -593,6 +718,102 @@ async function main() {
     acp.rpc.output.destroy();
   });
 
+  await test("权限选项：服务端预制选项透传（allow_project 携带持久规则载荷）；同 requestId 重发合并为一次弹窗", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", () => ({
+      session: { sessionId: "sess_perm", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextWindow: 128000 },
+    }));
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (s, u) => acp.sendUpdate(s, u), log: () => {}, client }),
+      log: () => {},
+    });
+    acp.bridge.onPermissionRequest = (req) => acp.requestPermission(req);
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    const permReqs = [];
+    clientRpc.on("request", (m) => { if (m.method === "session/request_permission") permReqs.push(m); });
+    await clientRpc.request("initialize", { protocolVersion: 2, capabilities: {} });
+    const sid = (await clientRpc.request("session/new", { cwd: "/w" })).sessionId;
+    // 夹具固化自实录流量（build 模式 Bash rm 的 interaction/requestPermission：options 各携 response 载荷）
+    const serverOptions = [
+      { kind: "allow_once", name: "Allow once", optionId: "allow_once", response: { decision: "allow", reason: "Approved once" } },
+      { kind: "allow_always", name: "Always allow in this project", optionId: "allow_project", description: "Do not ask again for matching requests in this project", response: { decision: "allow", permissionUpdates: [{ behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "rm -- victim.txt" }], type: "addRules" }], reason: "Approved for this project" } },
+      { kind: "deny", name: "Deny", optionId: "deny", response: { decision: "deny", reason: "The user doesn't want to proceed with this tool use." } },
+    ];
+    const fixture = { sessionId: sid, requestId: "perm_d670eb60", toolName: "Bash", riskLevel: "high", reason: "High risk tools require explicit approval", input: { command: "rm -- victim.txt", description: "Delete victim.txt" }, options: serverOptions };
+    const first = acp.bridge._answerServer("interaction/requestPermission", fixture);
+    await wait(permReqs, (p) => p.length >= 1, "权限请求出线");
+    // v2 主体：Bash 命令走 command 主体（command/cwd）；选项 kind 映射（deny→reject_once）
+    const p0 = permReqs[0].params;
+    assert.equal(p0.subject.type, "command");
+    assert.equal(p0.subject.command, "rm -- victim.txt");
+    assert.equal(p0.subject.cwd, "/w");
+    assert.deepEqual(p0.options, [
+      { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+      { optionId: "allow_project", name: "Always allow in this project", kind: "allow_always" },
+      { optionId: "deny", name: "Deny", kind: "reject_once" },
+    ]);
+    // app-server 未应答 ~5s 超时后以相同 requestId 重发：合并到既有弹窗，不重复出线
+    const second = acp.bridge._answerServer("interaction/requestPermission", fixture);
+    await sleep(120);
+    assert.equal(permReqs.length, 1, "重发请求不应再出线新弹窗");
+    clientRpc.respond(permReqs[0].id, { outcome: { outcome: "selected", optionId: "allow_project" } });
+    assert.deepEqual(await first, serverOptions[1].response, "选中 allow_project 时回传其完整 response 载荷（含 permissionUpdates）");
+    assert.deepEqual(await second, serverOptions[1].response, "重发的服务端等待者收到同一应答");
+    acp.rpc.output.destroy();
+  });
+
+  await test("权限主体：非命令工具走 tool_call 主体（字段名为 toolCall）；无服务端选项时合成 Allow/Deny", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", () => ({
+      session: { sessionId: "sess_w", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextWindow: 128000 },
+    }));
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (s, u) => acp.sendUpdate(s, u), log: () => {}, client }),
+      log: () => {},
+    });
+    acp.bridge.onPermissionRequest = (req) => acp.requestPermission(req);
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    const permReqs = [];
+    clientRpc.on("request", (m) => { if (m.method === "session/request_permission") permReqs.push(m); });
+    await clientRpc.request("initialize", { protocolVersion: 2, capabilities: {} });
+    const sid = (await clientRpc.request("session/new", { cwd: "/w" })).sessionId;
+    // 夹具固化自实录流量（build 模式 Write 的反向请求，此处验主体形状，不带 options 走合成兜底）
+    const w = acp.bridge._answerServer("interaction/requestPermission", {
+      sessionId: sid,
+      requestId: "perm_w1",
+      toolName: "Write",
+      riskLevel: "medium",
+      reason: "Tool has side effects and requires approval",
+      input: { file_path: "/w/a.txt", content: "x\n" },
+    });
+    await wait(permReqs, (p) => p.length >= 1, "Write 权限请求出线");
+    const p = permReqs[0].params;
+    assert.equal(p.subject.type, "tool_call");
+    assert.equal(p.subject.toolCall.toolCallId, "perm_w1");
+    assert.equal(p.subject.toolCall.rawInput.file_path, "/w/a.txt");
+    assert.deepEqual(p.options, [
+      { optionId: "allow", name: "Allow", kind: "allow_once" },
+      { optionId: "deny", name: "Deny", kind: "reject_once" },
+    ]);
+    clientRpc.respond(permReqs[0].id, { outcome: { outcome: "cancelled" } });
+    assert.deepEqual(await w, { decision: "deny" }, "cancelled 收敛为 deny");
+    acp.rpc.output.destroy();
+  });
+
   await test("压缩：session.updated cmp_* 生命周期 → compaction_update（in_progress/completed），其余杂项不消费", async () => {
     const { bridge, client, sent } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });
@@ -698,6 +919,43 @@ async function main() {
     assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").currentValue, "prov-a/model-y");
     assert.equal(lr.configOptions.find((o) => o.id === "zcode.model").options.length, CATALOG.length);
     acp.rpc.output.destroy();
+  });
+
+  await test("resume：模式从会话存储的 execution_state 恢复（resume 响应实测不回填持久化模式）", async () => {
+    const { bridge, client } = makeBridge();
+    client.handlers.set("session/resume", () => ({
+      messages: [],
+      // 换进程后真实 zcode 恒返回默认模式（实测），持久化值只在 execution_state 落盘
+      session: { sessionId: "sess_old", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      settings: { model: { available: CATALOG } },
+    }));
+    bridge._readHistory = async () => [];
+    bridge._getExecutionMode = async () => "edit";
+    const r = await bridge.resume({ sessionId: "sess_old", cwd: "/w" });
+    assert.ok(
+      client.requests.some((x) => x.method === "session/setMode" && x.params.mode === "edit"),
+      "应以持久化模式 edit 调 setMode",
+    );
+    assert.equal(r.configOptions.find((o) => o.configId === "zcode.mode").currentValue, "edit");
+
+    // 存储缺失时回落 resume 响应模式，不额外 setMode
+    const client2 = new FakeClient();
+    client2.handlers.set("session/create", () => ({}));
+    client2.handlers.set("session/subscribe", {});
+    client2.handlers.set("session/resume", () => ({
+      messages: [],
+      session: { sessionId: "sess_nostore", mode: "guarded", model: { providerId: "prov-a", modelId: "model-x" } },
+      settings: { model: { available: CATALOG } },
+    }));
+    const sent2 = [];
+    const bridge2 = new AppServerBridge({ sendUpdate: (s, u) => sent2.push({ sessionId: s, update: u }), log: () => {}, client: client2 });
+    bridge2._readHistory = async () => [];
+    bridge2._listCliCommands = async () => ({ commands: [] });
+    bridge2._listCliSkills = async () => ({ skills: [] });
+    bridge2._getExecutionMode = async () => null;
+    const r2 = await bridge2.resume({ sessionId: "sess_nostore", cwd: "/w" });
+    assert.ok(!client2.requests.some((x) => x.method === "session/setMode"), "无存储值不应 setMode");
+    assert.equal(r2.configOptions.find((o) => o.configId === "zcode.mode").currentValue, "guarded");
   });
 
   await test("连接换代：gen 变化后 prompt 触发 session/resume 重挂", async () => {

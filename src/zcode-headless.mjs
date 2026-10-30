@@ -225,6 +225,24 @@ export async function getSessionModelSelection(sessionId) {
   }
 }
 
+// 会话持久化的执行模式（session_entry 的 runtime/execution_state，形如 {"mode":"edit"}）。
+// session/resume 响应不回填该值（实测换进程后恒返回默认 build），适配器据此恢复。
+export async function getSessionExecutionMode(sessionId) {
+  const db = await openDb();
+  if (!db) return null;
+  try {
+    const row = db
+      .prepare(
+        "SELECT data FROM session_entry WHERE session_id = ? AND type = 'runtime/execution_state' ORDER BY time_updated DESC LIMIT 1",
+      )
+      .get(sessionId);
+    const mode = row?.data ? JSON.parse(row.data)?.mode : null;
+    return typeof mode === "string" && mode ? mode : null;
+  } catch {
+    return null;
+  }
+}
+
 // ACP session/list 游标分页：cursor 为不透明 base64url JSON {offset}，非法值回落第一页；
 // 还有后续页时返回 nextCursor。页大小 50。
 export function paginateSessions(sessions, cursor, pageSize = 50) {
@@ -290,13 +308,16 @@ export async function getSession(sessionId) {
 // 读取会话历史，输出 [{ role, texts, thoughts, tools }]：
 // role=user 仅保留真实用户输入（过滤 synthetic 注入），文本合并；
 // assistant 的 reasoning 与 tool part 一并提取（回放用）。
-export async function readHistory(sessionId, maxMessages = 400) {
+// 超长会话取「尾部窗口」（最近 maxMessages 条）：早前实现取头部，超限后最近消息全部丢失。
+export async function readHistory(sessionId, maxMessages = 2000) {
   const db = await openDb();
   if (!db) return [];
   try {
+    const total = db.prepare("SELECT count(*) c FROM message WHERE session_id = ?").get(sessionId).c;
+    const offset = Math.max(0, total - maxMessages);
     const msgs = db
-      .prepare("SELECT id, sequence, data FROM message WHERE session_id = ? ORDER BY sequence LIMIT ?")
-      .all(sessionId, maxMessages);
+      .prepare("SELECT id, sequence, data FROM message WHERE session_id = ? ORDER BY sequence LIMIT ? OFFSET ?")
+      .all(sessionId, maxMessages, offset);
     const partsByMessage = new Map();
     const parts = db
       .prepare(

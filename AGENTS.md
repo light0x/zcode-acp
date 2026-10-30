@@ -30,7 +30,7 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 
 1. `session/cancel` 在 ACP 里是无 id 通知（Zed 中止按钮形态）；带 id 的请求形态并存。`_handleRequest` 与 `_handleNotification` 两个入口都必须分派，漏通知形态即中止失效。`$/cancel_request` 须对原请求回 `-32800` 并拒绝等待者。
 2. app-server 对已随 `model.streaming`（kind=tool_call）流出的工具输入，会在 `tool.updated` 中剥离 `input`（`inputOmitted=true, inputRef=model_stream`）。适配器必须消费流式 `tool_call` 事件留档，并在 `tool.updated` 缺 input 时回填 `title`/`rawInput`，否则客户端只见工具名不见命令。
-3. `session/resume` 响应与 `session/create` 同形：`slashCommands`、`settings.model.available`、`session.model/mode` 均在。新进程接管旧会话必须经 `_attach` 从中重建状态，否则丢命令表与模型目录。
+3. `session/resume` 响应与 `session/create` 同形：`slashCommands`、`settings.model.available`、`session.model/mode` 均在。新进程接管旧会话必须经 `_attach` 从中重建状态，否则丢命令表与模型目录。**注意 `session.mode` 换进程后恒为默认 build（resume 不回填持久化模式，实测）**：模式持久化在 sqlite `session_entry` 的 `runtime/execution_state`，`_attach` 须读取并以 `session/setMode` 恢复，否则重启 Zed 后 thread 丢失原模式。
 4. v1 `LoadSessionResponse` 与 `NewSessionResponse` 同形（`modes` + `configOptions`）。恢复会话的应答必须携带，否则 Zed 不显示模型/思考强度选择。
 5. v1 `session/new` 应答不能携带 `availableCommands`（客户端在注册会话前丢弃该通知）；命令表须在应答出线后异步 `_announceCommands` 发送。
 6. 命令表合并顺序：服务端 `slashCommands`（权威，goal/compact/init）→ 桥接基线（compact/skill）→ `zcode commands list --json`（截前 100 条）→ `skills list --json`（`qualifiedName` 缺失时兜底 `name`），按 name 去重。
@@ -41,6 +41,8 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 11. 权限/提问挂起期间（v2）报 `state_update: requires_action`，应答后 turn 仍在进行才回 `running`（桥接 turn 状态守卫）；v1 方言对非 idle 态不出线，天然抑制。
 12. 压缩生命周期来自 `session/event` 的 `session.updated` 信封（`operationId` 前缀 `cmp_*` + `status`），在 turn 守卫之前分派（自动压缩可能贴近 turn 边界）；摘要文本与 `summaryMessageId` 的字段对应未探明，摘要不出线——探明前不得凭想象补。
 13. `session/list` 游标为不透明 base64url JSON `{offset}`，非法值回落第一页；无头桥接的本地 `acp_*` 会话仅在第一页合并。
+14. 权限门控随会话模式（实测矩阵）：**build 门控 medium/high（Write、Bash rm 逐次询问，无会话级记忆），edit 门控 high；yolo 与 guarded 均不门控任何操作**（guarded 名实不符，实测连 Bash 删除都自动放行）。适配器默认跟随 zcode 会话默认 build——即开箱在 Zed 弹权限审批；不得回退强制 yolo（那会使弹窗永不出现）。
+15. `interaction/requestPermission` 的 `options[].response` 是该选项的预制应答载荷：客户端选中后必须把对应 `response` 原样回传服务端（`allow_project` 携带 `permissionUpdates` 持久规则；kind `deny` 在 ACP 侧映射 `reject_once`）。服务端对未应答请求约 5s 超时后**以相同 requestId、逐字节相同的参数重发**——适配器按 `sessionId+requestId` 合并为一次客户端弹窗并广播应答；对已超时请求的迟到应答服务端忽略（实测无害）。v2 的 `session/request_permission` 主体字段名是 `subject.toolCall`（非 `toolCallUpdate`），Bash 类命令输入走 `type:"command"` 主体（command/cwd）。
 
 ## 测试
 
@@ -60,15 +62,15 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 前置：Zed `agent_servers` 中「ZCode Windows」指向本适配器（全局 `zcode-acp` 链接本仓库时，改动即时生效）。
 
 1. 新建会话：`/` 菜单包含 goal、compact、init、skill 及技能命令（browser、documents、pdf 等）。
-2. 恢复历史会话（Agent 面板历史列表打开旧会话）：`/` 菜单仍含 goal/init，不缺服务端命令。
-3. 恢复历史会话：模式选择器显示该会话真实模式；模型与思考强度选择器齐全且当前值正确。思考档位取自会话存储的 model_selection（resume 响应不带档位）；仅从未设置过档位的会话显示未选。
+2. 恢复历史会话（Agent 面板历史列表打开旧会话）：`/` 菜单仍含 goal/init，不缺服务端命令；历史完整（超长会话取最近 2000 条尾部窗口，最近消息不丢失）。
+3. 恢复历史会话：模式选择器显示该会话真实模式（重启 Zed/适配器后延续——模式取自会话存储的 execution_state，resume 响应不回填）；模型与思考强度选择器齐全且当前值正确。思考档位取自会话存储的 model_selection（resume 响应不带档位）；仅从未设置过档位的会话显示未选。
 4. 生成进行中点中止：流式输出立即停止、turn 收束，无需重启会话即可继续对话。
 5. 工具执行命令卡片：标题为裸命令原文（无「Bash:」前缀、无省略号截断）；右上角 copy 得到完整命令。
-6. guarded 模式触发写操作：权限弹窗展示待执行命令；allow 后执行、deny 后跳过。
+6. 权限弹窗（默认 build 模式即触发）：新建会话让模型执行写文件或运行命令，弹窗展示待执行命令；Allow 后执行、Deny 后跳过；弹窗停留 10 秒以上再批准不出现重复弹窗（重发已合并）；选「Always allow in this project」后同类操作不再询问；不想被打扰切 yolo 模式。
 7. 切换模式/模型/思考档位：选择即时生效，下一轮按所选执行。
 8. `@` 提及本地文件发送：模型能读到文件内容并围绕其作答；用户消息回显为 chip（不是 `[file: …]` 之类文本）。
 9. 带图 prompt 发送：用户消息里图片只显示一份，不出现重复。
 10. edit/write/read 类工具卡片：目标文件可点击打开（read 定位到对应行）；edit 卡片渲染红绿 diff，同文件多处编辑的标题含 old→new 摘要可区分；标题与输出仍正常展示。
 11. 思考显示开关（Thinking Display）：默认精简——面板无思考流、回复照常；切「完整」后思考实时出线；恢复会话后开关回到默认精简（适配器本地状态，不持久化）。
-12. 上下文容量指示（待 Zed 支持）：适配器每轮结束已按规范发送 `usage_update`（used/size 成对），但当前已发布的 Zed 尚不渲染该通知——输入区无容量表不是适配器缺陷；Zed 实现后验收：容量表随轮次增长，`/compact` 后回落；恢复会话后首轮完成前无指示（turn.completed 才有占用数据）。
+12. 上下文容量指示（待 Zed 支持）：适配器每轮结束按规范发送 `usage_update`（used/size 成对，缺一不发）。**used 必须取主 turn 末次 `session.updated` 信封的 per-iteration `usage.inputTokens+outputTokens`（≈终态占用）**：`turn.completed.usage.totalTokens` 是全轮累计计费口径（Σ多次模型往返，带工具轮实测累计 67964 vs 占用 22841），直接采用会使用量破 100%；仅无信封且 `modelRequestCount=1` 时才可回退累计值。**size 必须取模型目录条目的 `contextWindow`（权威）**：`projection.contextWindow` 与 `runtime.contextUsage.size` 实测会回落为与当前模型不符的默认值（GLM 编码套餐 1M 模型换进程后两者均报 200000，曾使容量表显示 129% 而真实约 26%），仅目录缺失时才以下游来源兜底；信封的 `contextWindow`（实测恒 1000000，含 200K 的 deepseek）是工作区级数值、非模型窗口，不得用作 size。恢复/重挂的即时出线 used 以 `runtime.contextUsage.used` 为准（压缩会话跨进程 resume 的 `projection.contextUsed` 恒 0），两源皆 0 不发。历史回放 `readHistory` 取尾部窗口（默认最近 2000 条）——早前取头部 400 条，超限会话重启后丢失全部近期消息。当前已发布的 Zed 尚不渲染该通知；Zed 实现后验收：容量表随轮次增长、带工具轮不破 100%，`/compact` 后回落，恢复会话打开即有指示。
 13. 上下文压缩（待 v2 客户端）：`/compact` 后适配器发出 `compaction_update`（in_progress → completed）；已发布 Zed 协商 v1（无此变体）不可见，属预期；v2 客户端应显示压缩标记。

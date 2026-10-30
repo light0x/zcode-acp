@@ -15,6 +15,7 @@ import {
   listCliCommands,
   listCliSkills,
   getSessionModelSelection,
+  getSessionExecutionMode,
   resolveZcodeBin,
   paginateSessions,
 } from "./zcode-headless.mjs";
@@ -48,6 +49,7 @@ export class AppServerBridge {
     this._listSessions = listSessions;
     this._readHistory = readHistory;
     this._getModelSelection = getSessionModelSelection;
+    this._getExecutionMode = getSessionExecutionMode;
     this._listCliCommands = listCliCommands;
     this._listCliSkills = listCliSkills;
     // client 可注入替身（测试）；注入对象需实现 ensure/request/on/kill/generation
@@ -87,19 +89,27 @@ export class AppServerBridge {
     const st = this._state(zid);
     st.cwd = cwd;
     st.gen = client.generation;
-    st.contextWindow = r?.projection?.contextWindow;
-    if (r?.session?.model) this._adoptModel(st, r.session.model);
-    // 全量模型目录以 create 结果的 settings 快照为准（state 补丁只含当前 provider 的模型集）
+    // size（contextWindow）以模型目录条目为权威：projection/cu.size 实测会回落到与当前模型
+    // 不符的默认值（GLM 1M 模型换进程后两者均报 200000）；目录缺失时才以下游来源兜底。
+    // 先并目录再采纳模型，保证 _adoptModel 的目录兜底在全新进程上也能命中
     if (Array.isArray(r?.settings?.model?.available) && r.settings.model.available.length) {
       this.catalog = this._mergeCatalog(this.catalog, r.settings.model.available);
+    }
+    if (r?.session?.model) this._adoptModel(st, r.session.model);
+    if (typeof r?.projection?.contextWindow === "number" && typeof st.contextWindow !== "number") {
+      st.contextWindow = r.projection.contextWindow;
     }
     // 初始 todo 清单 → ACP plan（turn 结束后经 session/read 增量同步）
     if (Array.isArray(r?.todos)) {
       this._state(zid).lastTodos = this._todoEntries(r.todos);
       this._emitPlan(zid, r.todos);
     }
-    if (mode && MODE_VALUES.includes(mode)) st.mode = mode;    // 默认 yolo（与无头桥接行为一致）；会话默认为 build 时切过去
-    if (st.mode !== (r?.session?.mode ?? "build")) {
+    // 未显式指定模式时跟随 zcode 会话默认（build：副作用/高风险工具走权限审批，
+    // 经 ACP request_permission 在客户端弹窗批准；yolo 全自动放行）；
+    // 客户端传模式时以客户端为准并同步到 zcode
+    const serverMode = MODE_VALUES.includes(r?.session?.mode) ? r.session.mode : "build";
+    st.mode = mode && MODE_VALUES.includes(mode) ? mode : serverMode;
+    if (st.mode !== serverMode) {
       await client.request("session/setMode", { sessionId: zid, mode: st.mode });
     }
     await client.request("session/subscribe", { sessionId: zid, deliveryKind: "desktop-continuous" });
@@ -355,14 +365,39 @@ export class AppServerBridge {
       sessionId: st.sessionId,
       ...(st.cwd ? { workspace: { workspacePath: st.cwd, workspaceKey: st.cwd } } : {}),
     });
+    // 先并目录再采纳模型：_adoptModel 从目录条目兜底 contextWindow（usage_update 的 size 必填）
+    if (Array.isArray(r?.settings?.model?.available) && r.settings.model.available.length) {
+      this.catalog = this._mergeCatalog(this.catalog, r.settings.model.available);
+    }
     if (r?.session?.model) this._adoptModel(st, r.session.model);
     // resume 响应的 session.model 不带思考档位，从会话存储的 model_selection 补齐
     const selection = await this._getModelSelection(st.sessionId);
     if (selection) this._adoptModel(st, selection);
-    if (Array.isArray(r?.settings?.model?.available) && r.settings.model.available.length) {
-      this.catalog = this._mergeCatalog(this.catalog, r.settings.model.available);
+    if (typeof r?.projection?.contextWindow === "number" && typeof st.contextWindow !== "number") {
+      st.contextWindow = r.projection.contextWindow;
+    }
+    // 恢复/重挂后立即出线 usage_update。占用来源分级：runtime.contextUsage.used 优先
+    // （压缩会话跨进程 resume 时 projection.contextUsed 恒为 0、runtime 仍有正确值，实测）；
+    // 0 值不可信不发。contextUsage.size 兼作 contextWindow 缺失时的兜底。
+    const cu = r?.runtime?.contextUsage;
+    if (typeof st.contextWindow !== "number" && typeof cu?.size === "number") st.contextWindow = cu.size;
+    const used0 =
+      typeof cu?.used === "number" && cu.used > 0
+        ? cu.used
+        : typeof r?.projection?.contextUsed === "number" && r.projection.contextUsed > 0
+          ? r.projection.contextUsed
+          : undefined;
+    if (used0 !== undefined && typeof st.contextWindow === "number") {
+      this._update(st.sessionId, { sessionUpdate: "usage_update", used: used0, size: st.contextWindow });
     }
     if (r?.session?.mode && MODE_VALUES.includes(r.session.mode)) st.mode = r.session.mode;
+    // resume 响应不回填持久化模式（实测换进程后恒返回默认）：从会话存储的
+    // execution_state 恢复（zcode 在每次 setMode 时落盘），确保重启后模式延续
+    const storedMode = await this._getExecutionMode(st.sessionId);
+    if (storedMode && MODE_VALUES.includes(storedMode) && st.mode !== storedMode) {
+      await client.request("session/setMode", { sessionId: st.sessionId, mode: storedMode });
+      st.mode = storedMode;
+    }
     if (Array.isArray(r?.slashCommands) && r.slashCommands.length) st.serverSlashCommands = r.slashCommands;
     await client.request("session/subscribe", { sessionId: st.sessionId, deliveryKind: "desktop-continuous" });
     st.gen = client.generation;
@@ -417,11 +452,19 @@ export class AppServerBridge {
     const turn = st.turn;
     st.turn = null;
     for (const w of st.turnWaiters.splice(0)) w();
-    // used/size 均为 v2 规范必填：size（contextWindow）未知时不发，避免客户端整条丢弃
-    if (usage?.totalTokens !== undefined && typeof st.contextWindow === "number") {
+    // used/size 均为 v2 规范必填：size（contextWindow）未知时不发，避免客户端整条丢弃。
+    // used 取主 turn 末次模型调用的 input+output（信封 per-iteration usage，≈终态占用）；
+    // turn.completed.usage.totalTokens 是全轮累计（计费口径，多次往返求和，实测 3 次往返
+    // 累计 67964 vs 真实占用 22841），直接采用会使用量指示破 100%。无信封时仅单请求轮
+    // （modelRequestCount=1）可用累计值（此时累计==终态）。
+    const used = st.pendingContextUsed;
+    st.pendingContextUsed = undefined;
+    const fallbackUsed = usage?.modelRequestCount === 1 ? usage.totalTokens : undefined;
+    const usedValue = used ?? fallbackUsed;
+    if (usedValue !== undefined && typeof st.contextWindow === "number") {
       this._update(sessionId, {
         sessionUpdate: "usage_update",
-        used: usage.totalTokens,
+        used: usedValue,
         size: st.contextWindow,
       });
     }
@@ -586,6 +629,11 @@ export class AppServerBridge {
   // status started/completed；boundary 事件与摘要内容镜像的字段对应未探明，不臆造——摘要暂不出线）。
   // 其余 payload（模型调用细节、常规消息内容）不消费。
   _onSessionUpdated(st, payload) {
+    // 主 turn 的单次模型调用占用（信封 per-iteration usage，querySource=main_turn）：
+    // 末次 input+output ≈ 终态上下文占用，供 turn.completed 出线 usage_update（累计口径不可用）
+    if (payload?.querySource === "main_turn" && typeof payload?.usage?.inputTokens === "number" && typeof payload.usage.outputTokens === "number") {
+      st.pendingContextUsed = payload.usage.inputTokens + payload.usage.outputTokens;
+    }
     const opId = typeof payload?.operationId === "string" ? payload.operationId : null;
     if (!opId || !opId.startsWith("cmp_")) return;
     if (payload.status === "started") {
@@ -686,8 +734,11 @@ export class AppServerBridge {
             riskLevel: params?.riskLevel,
             reason: params?.reason,
             input: params?.input,
+            serverOptions: params?.options,
           })
         : "deny";
+      // 选中服务端预制选项时返回其完整 response 载荷（allow_project 携带 permissionUpdates 持久化规则）
+      if (decision && typeof decision === "object") return decision;
       return { decision: decision === "allow" ? "allow" : "deny" };
     }
     if (method === "interaction/requestProviderRuntimeHeaders") {
@@ -840,6 +891,9 @@ export class AppServerBridge {
     }
     const level = model.options?.reasoningLevel;
     if (level) st.reasoning = level;
+    // 上下文窗口兜底：usage_update 的 size 必填，恢复会话等无 projection 的路径靠目录补齐
+    const entry = this._catalogEntry(`${st.model.providerId}/${st.model.modelId}`);
+    if (typeof entry?.contextWindow === "number") st.contextWindow = entry.contextWindow;
   }
 
   _configOptions(st) {

@@ -24,6 +24,7 @@ let buf = "";
 let nextId = 1;
 const pending = new Map();
 const updates = [];
+const permRequests = [];
 
 function send(obj) {
   child.stdin.write(JSON.stringify(obj) + "\n");
@@ -58,6 +59,9 @@ child.stdout.on("data", (d) => {
     } else if (msg.method === "session/update") {
       updates.push(msg.params);
       process.stdout.write(".");
+    } else if (msg.method === "session/request_permission") {
+      permRequests.push(msg);
+      process.stdout.write("P");
     }
   }
 });
@@ -195,6 +199,54 @@ async function main() {
   );
   check("取消后 idle stopReason=cancelled", true);
 
+
+  // 6. 权限链路：默认 build 模式下高风险操作经 session/request_permission 弹窗批准。
+  //    延迟应答跨越 app-server 的 ~5s 重发周期，验证适配器合并为单弹窗；deny 后跳过。
+  {
+    const permSid = (await request("session/new", { cwd: workdir })).sessionId;
+    const modeOpt = Object.fromEntries((await request("session/set_config_option", { sessionId: permSid, configId: "zcode.mode", type: "id", value: "build" })).configOptions.map((o) => [o.configId, o]))["zcode.mode"];
+    check("默认模式 build（副作用/高风险工具走权限审批）", modeOpt?.currentValue === "build", JSON.stringify(modeOpt));
+
+    const victimA = path.join(workdir, "perm-allow.txt");
+    const victimB = path.join(workdir, "perm-deny.txt");
+    fs.writeFileSync(victimA, "x");
+    fs.writeFileSync(victimB, "x");
+    updates.length = 0;
+    permRequests.length = 0;
+    await request("session/prompt", {
+      sessionId: permSid,
+      prompt: [{ type: "text", text: "Delete the file perm-allow.txt in the current working directory by running a shell command. Do it directly without asking any question." }],
+    });
+    await waitFor(() => permRequests.length >= 1, 120000, "权限请求出线");
+    const opts2 = permRequests[0].params?.options ?? [];
+    check("权限请求携带服务端选项（Allow once / Always allow / Deny）", opts2.some((o) => o.kind === "allow_once") && opts2.some((o) => o.kind === "allow_always") && opts2.some((o) => o.kind === "reject_once"), JSON.stringify(opts2));
+    check("权限请求主体为命令形态", permRequests[0].params?.subject?.type === "command" && typeof permRequests[0].params?.subject?.command === "string", JSON.stringify(permRequests[0].params?.subject)?.slice(0, 160));
+    // 延迟 12s：跨 2-3 个 app-server 重发周期，适配器应合并为一次弹窗
+    await sleep(12000);
+    send({ jsonrpc: "2.0", id: permRequests[0].id, result: { outcome: { outcome: "selected", optionId: "allow_once" } } });
+    await waitFor(
+      () => updatesOf(permSid, "state_update").some((u) => u.update.state === "idle"),
+      180000,
+      "allow 后 turn 收束",
+    );
+    check("延迟应答期间重发被合并（客户端仍只见一次弹窗）", permRequests.length === 1, `permRequests=${permRequests.length}`);
+    check("allow 后命令执行（victim 已删除）", !fs.existsSync(victimA));
+
+    updates.length = 0;
+    permRequests.length = 0;
+    await request("session/prompt", {
+      sessionId: permSid,
+      prompt: [{ type: "text", text: "Delete the file perm-deny.txt in the current working directory by running a shell command. Do it directly without asking any question." }],
+    });
+    await waitFor(() => permRequests.length >= 1, 120000, "第二笔权限请求出线");
+    send({ jsonrpc: "2.0", id: permRequests[0].id, result: { outcome: { outcome: "selected", optionId: "deny" } } });
+    await waitFor(
+      () => updatesOf(permSid, "state_update").some((u) => u.update.state === "idle"),
+      180000,
+      "deny 后 turn 收束",
+    );
+    check("deny 后跳过执行（victim 保留）", fs.existsSync(victimB));
+  }
 
   // 7. image 端到端：纯红 PNG 经附件上传链送达，模型识别颜色
   {

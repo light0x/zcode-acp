@@ -199,13 +199,19 @@ Windows 与 WSL 各有一套 zcode 安装（各自 `~/.zcode` 的登录态、配
 点开选择即时生效。排查选项是否送达可用命令面板 `dev: open acp logs` 查看 ACP 流量。
 
 | 选项 | 取值 | 默认 | 说明 |
-
-| 选项 | 取值 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| Permission Mode（`zcode.mode`） | plan / build / edit / yolo / guarded | yolo | 权限模式，语义与 `zcode --mode` 一致；非 yolo 模式写操作弹权限确认 |
+| Permission Mode（`zcode.mode`） | plan / build / edit / yolo / guarded | **build**（跟随 zcode 会话默认） | 权限审批模式（实测语义）：**build / edit** 对副作用与高风险工具逐次弹窗审批；**yolo / guarded** 全自动放行（guarded 名字有迷惑性，实测不拦截任何操作）；plan 为只读规划。模式随会话持久化，重启 Zed 恢复 thread 后延续 |
 | Model（`zcode.model`） | 模型目录全量 | 会话当前值 | 切换模型（映射 `session/setModel`） |
 | Thinking（`zcode.reasoning`） | 当前模型的思考档位 | 模型默认档位 | 模型**实际**思考强度；越强思考越久、输出越长 |
 | Thinking Display（`zcode.thinking_display`） | 精简 (Concise) / 完整 (Full) | **精简**（可经 `ZCODE_ACP_THINKING_DISPLAY` 改默认） | 思考流**是否显示**：精简隐藏思考只看回复与工具卡片；完整实时显示思考过程 |
+
+权限审批（Zed 弹窗）要点：
+
+- 新建会话默认 build 模式：模型执行写文件、运行命令等操作前，Zed 弹出权限确认框，展示待执行命令／目标文件，**Allow 后执行、Deny 后跳过**；弹窗挂起期间会话显示等待操作状态（v2 客户端）。
+- 弹窗选项来自 zcode 服务端：Allow once（仅本次）、Always allow in this project（写入项目级持久规则，之后同类操作不再询问）、Deny；选择 Always 后由 zcode 落地规则，适配器原样透传。
+- app-server 对未应答的权限请求约 5 秒超时重发；适配器将同一逻辑请求合并为**一个**弹窗——慢慢看完命令再点批准不会堆出多个确认框。
+- 不想被打扰：把模式切到 yolo（全自动放行），下一轮即生效。
+- 客户端始终不应答（如断连）时按 deny 收敛，不会静默放行。
 
 Thinking Display 使用要点：
 
@@ -249,7 +255,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | `session/set_config_option`（v1 为 `session/set_mode`） | `zcode.mode` → `session/setMode`；`zcode.model` / `zcode.reasoning` → `session/setModel`；`zcode.thinking_display` → 适配器本地思考流显示开关；结果回传更新后的配置 |
 | 非法值（`-32602`） | 未知 configId、越界的 model/reasoning 取值 |
 | 斜杠命令（`/compact`、`/skill`、插件命令） | prompt 文本以 `/` 开头时原样透传，由 zcode 服务端处理 |
-| 权限请求（`build`/`edit`/`guarded` 模式） | 服务端反向请求 `interaction/requestPermission` → ACP `session/request_permission`（Zed 权限弹窗）→ `{decision}` 回传；无应答按 deny 收敛 |
+| 权限请求（`build`/`edit` 模式；默认即 build） | 服务端反向请求 `interaction/requestPermission`（携带 `options[].response` 预制应答载荷）→ ACP `session/request_permission`（Zed 权限弹窗）→ 选中选项的 response 载荷原样回传（Always allow 携带 `permissionUpdates` 持久规则）；未应答约 5s 服务端同 requestId 重发，适配器合并为单弹窗；始终无应答按 deny 收敛 |
 
 历史回放：`replayFrom: {type:"start"}`（v1 `session/load` 固定从头回放）时从 sqlite `message`/`part` 表
 读出会话历史，翻译为 `user_message`（过滤 synthetic 注入）、`agent_thought`、`tool_call_update`（含 input/output）、
@@ -272,7 +278,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | session（new/prompt/cancel/resume/list/close/set_config_option） | ✅ | ACP 七个基线方法全实现；会话与历史读写 app-server 协议 + sqlite 会话存储 |
 | 模型 / 思考强度 | ✅ | 全量目录来自 `session/create` 的 `settings.model.available` 快照，`state.updated` 补丁按 model 合并更新当前 provider 的可用集；`zcode.model` / `zcode.reasoning` 两个 config option 映射 `session/setModel`，v1 客户端经 `session/set_config_option` 同样可用。编码套餐账号通道（`account:*-coding-plan`）仅桌面上下文物化——适配器按官方「启动器从受控凭据来源写入临时配置」模式（usage/03-config.md），将凭据库解密的套餐 key 以 `personalModelIds` 形态注入临时个人配置副本（`~/.zcode/cli/zcode-acp-provider-config.json`），使套餐 GLM 模型在独立会话可选 |
 | 流式输出 | ✅ | app-server：`model.streaming` 的 `text_delta` / `reasoning_delta` 逐字翻译为 `agent_message_chunk` / `agent_thought_chunk`（思考流出线受 `zcode.thinking_display` 控制，默认精简）；无头回退后端经官方 `--output-format stream-json` 事件同样逐字流式 |
-| 权限交互 | ✅ | 非 yolo 模式下 `interaction/requestPermission` → ACP `session/request_permission`（Zed 弹窗）→ `{decision}`；默认 `yolo` 自动放行，可用 config option 切换 |
+| 权限交互 | ✅ | 默认 build 模式：副作用/高风险工具触发 `interaction/requestPermission` → ACP `session/request_permission`（Zed 弹窗，Allow once / Always allow / Deny）→ 选中选项的 response 载荷回传（Always 含持久规则）；约 5s 未应答服务端重发，适配器合并为单弹窗；yolo/guarded 模式不触发审批（实测 guarded 不拦截），可用 config option 切换 |
 | command（斜杠命令） | ✅ | `session/new`/`resume` 返回 `availableCommands`：内置命令（`/compact`、`/skill`）+ `commands list` 的自定义/插件命令（含参数 hint）；用户输入的 `"/name args"` 原样透传（`/compact`、`/skill`、插件命令均已验证生效） |
 | skill（技能） | ✅ | `/skill <name> <task>` 调用；技能清单（`skills list`）拼入 `/skill` 命令描述供挑选；工作区与用户级技能自动生效 |
 | plugin / MCP 服务器 | ✅ | app-server 按工作区自动装配 zcode 已启用插件的全部能力（命令、技能、MCP 服务器、hooks）；ACP `session/new` 的 `mcpServers` 透传不适用（未声明该能力） |
@@ -280,7 +286,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | 工具调用展示 | ✅ | 实时状态迁移（pending → in_progress → completed/failed）；标题带语义（命令原文 / 文件路径 + old→new 摘要）；文件目标带 locations 可点击打开；输出文本随完成事件回传；edit/write 的 `structuredPatch` 转 diff 内容块——Zed 渲染红绿 diff，v1 由 git_patch 文本还原 oldText/newText |
 | 图片/音频输入（prompt image/audio 块） | ✅ | 同一通路：app-server 走官方分块上传协议（v4/attachment/begin→chunk→commit）随 session/send 附件发送；无头后端落临时文件经官方 --attach。image/audio 能力均已声明（音频上传链实测接受 audio/*）；模型是否实际消费取决于其 `inputFormat.supportsAudio/supportsImage`（实测非听觉模型静默忽略音频附件，turn 正常收束，与 image 在非视觉模型上的行为同口径） |
 | 任务清单（todo） | ✅ | zcode todos → ACP plan 更新（v1 plan／v2 plan_update），create 快照 + turn 后 diff 同步 |
-| 上下文容量指示 | ✅（数据侧） | 每轮结束发 `usage_update`（`used` 实测为当前上下文占用——基线+增量+本轮输出，非计费累计；`size` 取模型 contextWindow；按规范成对发送，缺一不发）。**注意：当前已发布的 Zed 尚未渲染该通知**（源码与更新日志均无此 UI），数据就绪，Zed 实现后自动显示，期间可用 `/compact` 主动压缩上下文 |
+| 上下文容量指示 | ✅（数据侧） | 每轮结束发 `usage_update`：`used` 取主 turn 末次模型调用的 input+output（终态占用；`turn.completed` 的 totalTokens 是全轮累计计费口径——带工具轮多次往返求和，直接采用会破 100%）；`size` 取模型目录条目的 contextWindow（权威——服务端 projection/runtime 实测会回落为与模型不符的默认值）。恢复会话立即出线（占用取 `runtime.contextUsage.used`）。**注意：当前已发布的 Zed 尚未渲染该通知**（源码与更新日志均无此 UI），数据就绪，Zed 实现后自动显示，期间可用 `/compact` 主动压缩上下文 |
 | 提问（AskUserQuestion） | ✅ | app-server interaction/requestUserInput → ACP elicitation/create（form），应答按 question 键回传 answers；multiSelect 以 array+enum 表单渲染并按选项数组回传（非法选项过滤，空结果按 cancel 收敛） |
 | 等待用户操作状态（requires_action，v2） | ✅ | 权限弹窗/提问挂起期间报 `state_update: requires_action`，应答后 turn 仍在进行则回 `running`（v1 无此状态，方言层抑制） |
 | 上下文压缩（compaction，v2） | ✅ | `/compact` 触发的压缩生命周期（session.updated 的 cmp_* 操作）映射 `compaction_update`（in_progress → completed）；已发布 Zed 走 v1 无此变体，v2 客户端可显示压缩标记；摘要文本的字段对应未探明，暂不出线 |

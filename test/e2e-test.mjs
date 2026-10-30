@@ -25,6 +25,7 @@ let buf = "";
 let nextId = 1;
 const pending = new Map();
 const updates = [];
+const permGrants = []; // 已自动放行的权限请求（默认 build 模式下写工具会触发）
 
 function send(obj) {
   child.stdin.write(JSON.stringify(obj) + "\n");
@@ -37,7 +38,7 @@ function request(method, params) {
   });
 }
 function notify(method, params) {
-  send({ jsonrpc: "2.0", method, params: params ?? {} });
+  send({ jsonrpc: "2.0", method, params });
 }
 
 child.stdout.on("data", (d) => {
@@ -62,6 +63,11 @@ child.stdout.on("data", (d) => {
     } else if (msg.method === "session/update") {
       updates.push(msg.params);
       process.stdout.write(".");
+    } else if (msg.method === "session/request_permission") {
+      // 默认 build 模式下写/命令工具触发权限审批：本套件聚焦工具执行链路，自动放行一次
+      const allow = (msg.params?.options ?? []).find((o) => o.kind === "allow_once") ?? msg.params?.options?.[0];
+      permGrants.push(msg.params);
+      send({ jsonrpc: "2.0", id: msg.id, result: { outcome: { outcome: "selected", optionId: allow?.optionId ?? "allow" } } });
     }
   }
 });
@@ -192,6 +198,9 @@ async function main() {
     "工具 prompt 完成",
   );
   check("工具真实执行（文件已创建）", fs.existsSync(path.join(workdir, "out.txt")));
+  if (appserverBackend) {
+    check("默认 build 模式下写工具经权限审批（骨架已自动放行）", permGrants.length >= 1, `permGrants=${permGrants.length}`);
+  }
 
   // 6. session/list（sqlite 支撑，包含本会话的 zcode 真实 ID）
   r = await request("session/list", { cwd: workdir });

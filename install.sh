@@ -35,6 +35,17 @@ command -v npm >/dev/null 2>&1 || die "npm not found (should ship with Node.js).
 
 # ---------- 2. 全局安装 ----------
 say "全局安装 zcode-acp（npm install -g）"
+# 来源提交：打印 HEAD 供核对是否最新；npm 按 bin/src 白名单打包，脏区检查只看会随包安装的路径
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  COMMIT="$(git -C "$ROOT" log -1 --format='%h %s (%cd)' --date=iso 2>/dev/null || true)"
+  if [ -n "$COMMIT" ]; then
+    printf "  ${GREEN}来源提交:${OFF} %s\n" "$COMMIT"
+    [ -n "$(git -C "$ROOT" status --porcelain -- bin src README.md package.json 2>/dev/null)" ] \
+      && warn "bin/src/package.json 存在未提交改动，安装内容可能超出该提交"
+  fi
+else
+  warn "非 git 仓库检出，无法显示提交信息"
+fi
 if npm install -g "$ROOT" >/dev/null; then
   ok "installed"
 else

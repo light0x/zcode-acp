@@ -16,6 +16,7 @@ export class AcpAgent {
     this.version = null; // 协商后的协议版本：1 或 2
     this.clientCapabilities = {};
     this._livePerm = new Map(); // 权限请求合并表：key `${sessionId}:${toolCallId}` → 在途等待者
+    this._liveElicit = new Map(); // 提问合并表：key 会话+问题内容 → 在途等待者
     this.v1 = new V1Dialect({ agent: this, bridge, log, info: AGENT_INFO });
 
     this.rpc.on("request", (msg) => {
@@ -137,10 +138,28 @@ export class AcpAgent {
   // 桥接层的单选提问（app-server interaction/requestUserInput）→ ACP 表单式 elicitation，
   // 应答映射回 {action, answers}。客户端无响应/超时按 cancel 收敛。
   // 挂起期间按 v2 规范报 requires_action，应答后 turn 仍在进行则回 running（v1 方言抑制非 idle 态）。
+  // 服务端对未应答的提问反向请求约 5s 超时后以相同参数重发：同一问题合并为一次客户端弹窗，
+  // 应答广播给所有在途的服务端等待者（无人值守时避免反复弹窗）。
   async requestElicitation(req) {
-    const { sessionId } = req;
     const labels = (req.options ?? []).map((o) => o.label).filter(Boolean);
     if (!labels.length) return { action: "cancel" };
+    const elicitKey = `${req.sessionId}:${req.message}:${JSON.stringify(req.options)}${req.multiSelect ? ":multi" : ""}`;
+    const live = this._liveElicit.get(elicitKey);
+    if (live) return new Promise((resolve) => live.waiters.push(resolve));
+    const state = { waiters: [] };
+    this._liveElicit.set(elicitKey, state);
+    let outcome;
+    try {
+      outcome = await this._askElicitation(req, labels);
+    } finally {
+      this._liveElicit.delete(elicitKey);
+    }
+    for (const w of state.waiters) w(outcome);
+    return outcome;
+  }
+
+  async _askElicitation(req, labels) {
+    const { sessionId } = req;
     // multiSelect：array + items.enum 表单（客户端按多选渲染）；单选为 string enum
     const choiceSchema = req.multiSelect
       ? { type: "array", items: { type: "string", enum: labels }, uniqueItems: true }

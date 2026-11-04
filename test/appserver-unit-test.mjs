@@ -1052,6 +1052,68 @@ async function main() {
     assert.equal(r2.action, "cancel");
   });
 
+  await test("elicitation 合并：提问反向请求超时重发（相同参数）并入同一弹窗，应答广播给所有服务端等待者", async () => {
+    const client = new FakeClient();
+    client.handlers.set("session/create", () => ({
+      session: { sessionId: "sess_el", mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+      projection: { contextWindow: 128000 },
+    }));
+    client.handlers.set("session/setMode", {});
+    client.handlers.set("session/subscribe", {});
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (s, u) => acp.sendUpdate(s, u), log: () => {}, client }),
+      log: () => {},
+    });
+    acp.bridge.onElicitation = (req) => acp.requestElicitation(req);
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    const elicitReqs = [];
+    clientRpc.on("request", (m) => { if (m.method === "elicitation/create") elicitReqs.push(m); });
+    const wire = [];
+    clientRpc.on("notification", (m) => { if (m.method === "session/update") wire.push(m.params.update); });
+    await clientRpc.request("initialize", { protocolVersion: 2, capabilities: {} });
+    const sid = (await clientRpc.request("session/new", { cwd: "/w" })).sessionId;
+    // 夹具形状固化自实录流量：证书验证 choice 提问（服务端 ~5s 超时重发为逐字节相同参数）
+    const fixture = {
+      sessionId: sid,
+      questions: [{
+        header: "证书验证",
+        question: "生产服务器上，Let's Encrypt 的证书验证采用哪种方式？",
+        multiSelect: false,
+        options: [{ label: "公网 80/443 均可达（推荐）" }, { label: "公网仅 80 可达，443 用高端口" }, { label: "80/443 均不可达，用 DNS-01" }],
+      }],
+    };
+    const first = acp.bridge._answerServer("interaction/requestUserInput", fixture);
+    await wait(
+      elicitReqs,
+      (p) => p.length >= 1 && wire.some((u) => u.sessionUpdate === "state_update" && u.state === "requires_action"),
+      "elicitation + requires_action",
+    );
+    assert.equal(elicitReqs[0].params.message, "证书验证：生产服务器上，Let's Encrypt 的证书验证采用哪种方式？");
+    assert.deepEqual(elicitReqs[0].params.requestedSchema, {
+      type: "object",
+      properties: { choice: { type: "string", enum: fixture.questions[0].options.map((o) => o.label) } },
+      required: ["choice"],
+    });
+    // 超时重发：合并到既有弹窗，不重复出线、requires_action 不重复广播
+    const second = acp.bridge._answerServer("interaction/requestUserInput", fixture);
+    await sleep(120);
+    assert.equal(elicitReqs.length, 1, "重发请求不应再出线新弹窗");
+    assert.equal(
+      wire.filter((u) => u.sessionUpdate === "state_update" && u.state === "requires_action").length,
+      1,
+      "requires_action 只随首次弹窗发一次",
+    );
+    clientRpc.respond(elicitReqs[0].id, { action: "accept", content: { choice: "80/443 均不可达，用 DNS-01" } });
+    const expected = { action: "accept", content: { answers: { "生产服务器上，Let's Encrypt 的证书验证采用哪种方式？": "80/443 均不可达，用 DNS-01" } } };
+    assert.deepEqual(await first, expected);
+    assert.deepEqual(await second, expected, "重发的服务端等待者收到同一应答");
+    acp.rpc.output.destroy();
+  });
+
   await test("图片：附件分块上传链（begin/chunk/commit）→ send 携带 attachments", async () => {
     const { bridge, client } = makeBridge();
     client.handlers.set("v4/attachment/begin", { uploadId: "u", state: "staging" });

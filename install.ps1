@@ -12,6 +12,24 @@ function Say($m) { Write-Host "== $m" -ForegroundColor Cyan }
 function Ok($m) { Write-Host "  ok: $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "  ! $m" -ForegroundColor Yellow }
 function Die($m) { Write-Host "  error: $m" -ForegroundColor Red; exit 1 }
+# 来源提交：打印 HEAD 供核对是否最新；npm 按 bin/src 白名单打包，脏区检查只看会随包安装的路径。
+# 先把控制台输出编码切到 UTF-8，否则中文 commit subject 会按系统 ANSI 代码页解码成乱码。
+function Show-SourceCommit {
+  $savedEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Warn "未找到 git，无法显示提交信息"; return }
+    $commit = & git -C $Root log -1 --format='%h %s (%cd)' --date=iso 2>$null
+    if (-not $commit) { Warn "非 git 仓库检出，无法显示提交信息"; return }
+    Write-Host ("  来源提交: " + ($commit -join " ")) -ForegroundColor Green
+    if (& git -C $Root status --porcelain -- bin src README.md package.json 2>$null) {
+      Warn "bin/src/package.json 存在未提交改动，安装内容可能超出该提交"
+    }
+  } finally {
+    $ErrorActionPreference = $savedEap
+  }
+}
 
 Say "zcode-acp 安装（Windows / $env:PROCESSOR_ARCHITECTURE）"
 
@@ -32,6 +50,7 @@ Ok "node $(& node --version)"
 
 # ---------- 2. 全局安装 ----------
 Say "全局安装 zcode-acp（npm install -g）"
+Show-SourceCommit
 Push-Location $Root
 try {
   npm install -g . --no-fund --no-audit

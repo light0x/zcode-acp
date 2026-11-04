@@ -42,7 +42,7 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 12. 压缩生命周期来自 `session/event` 的 `session.updated` 信封（`operationId` 前缀 `cmp_*` + `status`），在 turn 守卫之前分派（自动压缩可能贴近 turn 边界）；摘要文本与 `summaryMessageId` 的字段对应未探明，摘要不出线——探明前不得凭想象补。
 13. `session/list` 游标为不透明 base64url JSON `{offset}`，非法值回落第一页；无头桥接的本地 `acp_*` 会话仅在第一页合并。
 14. 权限门控随会话模式（实测矩阵）：**build 门控 medium/high（Write、Bash rm 逐次询问，无会话级记忆），edit 门控 high；yolo 与 guarded 均不门控任何操作**（guarded 名实不符，实测连 Bash 删除都自动放行）。适配器默认跟随 zcode 会话默认 build——即开箱在 Zed 弹权限审批；不得回退强制 yolo（那会使弹窗永不出现）。
-15. `interaction/requestPermission` 的 `options[].response` 是该选项的预制应答载荷：客户端选中后必须把对应 `response` 原样回传服务端（`allow_project` 携带 `permissionUpdates` 持久规则；kind `deny` 在 ACP 侧映射 `reject_once`）。服务端对未应答请求约 5s 超时后**以相同 requestId、逐字节相同的参数重发**——适配器按 `sessionId+requestId` 合并为一次客户端弹窗并广播应答；对已超时请求的迟到应答服务端忽略（实测无害）。v2 的 `session/request_permission` 主体字段名是 `subject.toolCall`（非 `toolCallUpdate`），Bash 类命令输入走 `type:"command"` 主体（command/cwd）。
+15. `interaction/requestPermission` 的 `options[].response` 是该选项的预制应答载荷：客户端选中后必须把对应 `response` 原样回传服务端（`allow_project` 携带 `permissionUpdates` 持久规则；kind `deny` 在 ACP 侧映射 `reject_once`）。服务端对未应答请求约 5s 超时后**以相同 requestId、逐字节相同的参数重发**——适配器按 `sessionId+requestId` 合并为一次客户端弹窗并广播应答；对已超时请求的迟到应答服务端忽略（实测无害）。v2 的 `session/request_permission` 主体字段名是 `subject.toolCall`（非 `toolCallUpdate`），Bash 类命令输入走 `type:"command"` 主体（command/cwd）。重发机制同样作用于 `interaction/requestUserInput`（提问）：适配器按 `sessionId+问题内容` 合并为一次 elicitation 弹窗并广播应答，否则无人值守时客户端反复弹窗（实测）。
 
 ## 测试
 

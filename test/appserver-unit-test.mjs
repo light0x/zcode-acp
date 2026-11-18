@@ -268,6 +268,52 @@ async function main() {
     assert.ok(!sent.some((x) => x.update.sessionUpdate === "usage_update"), "缺 size 时不应发 usage_update");
   });
 
+  await test("turn.failed：payload.error 为结构化对象（实录）时提取可读文本与根因", async () => {
+    // 回归钉住：payload.error 原样进 message 会在 v1 线上拼成 "[object Object]"
+    // （实测 /init 时 provider 流断，Zed 只见 [error] [object Object]）
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "/init" }] });
+    client.evt(sessionId, "turn.failed", {
+      // 夹具固化自 protocol.log 实录（app-server 3.18.2，schema 见 zcodeTurnFailedEventPayloadSchema）
+      error: {
+        type: "unknown_error",
+        message: "Model request failed.",
+        code: "model_request_failed",
+        detail: "Turn execution failed\nprovider=bigmodel-coding-plan reason=unknown\nClient signing requires an API Key or Project Access Token.",
+        underlyingErrorMessage: "Client signing requires an API Key or Project Access Token.",
+        attribution: { source: "provider", reason: "unknown", errorPhase: "stream", retryable: false },
+      },
+      turnPhase: "model_stream",
+    });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update" && x.update.state === "idle"), "idle");
+    const idle = sent.filter((x) => x.update.sessionUpdate === "state_update").pop();
+    assert.equal(idle.update.stopReason, "error");
+    assert.equal(
+      idle.update.error.message,
+      "Model request failed. (model_request_failed): Client signing requires an API Key or Project Access Token.",
+      "message 应为可读字符串并携带根因",
+    );
+  });
+
+  await test("turn.failed：payload.error 缺失时回落 reason / 事件名，不输出 [object Object]", async () => {
+    const { bridge, client, sent } = makeBridge();
+    const { sessionId } = await bridge.createNew({ cwd: "/w" });
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "hi" }] });
+    client.evt(sessionId, "turn.failed", { reason: "boom", turnPhase: "init" });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update" && x.update.state === "idle"), "idle");
+    let idle = sent.filter((x) => x.update.sessionUpdate === "state_update").pop();
+    assert.equal(idle.update.error.message, "boom");
+    client.requests.length = 0;
+    sent.length = 0;
+    await bridge.prompt({ sessionId, blocks: [{ type: "text", text: "again" }] });
+    client.evt(sessionId, "turn.failed", { turnPhase: "init" });
+    await wait(sent, (s) => s.some((x) => x.update.sessionUpdate === "state_update" && x.update.state === "idle"), "idle");
+    idle = sent.filter((x) => x.update.sessionUpdate === "state_update").pop();
+    assert.equal(idle.update.error.message, "turn turn.failed");
+    assert.ok(!String(idle.update.error.message).includes("[object"));
+  });
+
   await test("usage_update：恢复会话从 resume 响应重建 contextWindow（projection 权威，目录兜底）", async () => {
     // 回归钉住：resume 的新会话状态 contextWindow 为 null，_attach 不恢复会导致
     // 整个恢复会话期间 usage_update 静默停发（used/size 成对校验），客户端用量图标消失
@@ -1008,6 +1054,48 @@ async function main() {
     assert.deepEqual(probe._providerEnv(), {});
     process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = saved.b;
     process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = saved.p;
+  });
+
+  await test("凭据解密：enc:v2:env（key=sha256(secret 文件)，keyHint 校验）与 v1 兼容、os 来源拒绝", async () => {
+    // 夹具按 zcode 3.18.2 zcode.cjs 实测算法构造（LTo/pvt/lEn）：v2 值
+    // enc:v2:env:<sha256(key).hex[0:24]>:<iv>.<tag>.<data>，key=sha256(credential-secret)
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fsMod = await import("node:fs");
+    const crypto = await import("node:crypto");
+    const tmp = fsMod.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-cred-"));
+    const secret = "s".repeat(43); // ≥32 字节，模拟 credential-secret（32 字节随机数的 base64url 形态）
+    fsMod.writeFileSync(path.join(tmp, "credential-secret"), secret);
+    const key = crypto.createHash("sha256").update(secret).digest();
+    const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+    const enc = (plain) => {
+      const iv = crypto.randomBytes(12);
+      const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+      const data = Buffer.concat([c.update(plain, "utf8"), c.final()]);
+      return `enc:v2:env:${hint}:${iv.toString("base64url")}.${c.getAuthTag().toString("base64url")}.${data.toString("base64url")}`;
+    };
+    fsMod.writeFileSync(
+      path.join(tmp, "credentials.json"),
+      JSON.stringify({
+        "account-provider:coding-plan:account:bigmodel-account:account:1:api-key": enc("sk-plan-key-123"),
+        "oauth:bigmodel:access_token": enc("tok"),
+      }),
+    );
+    const { AppServerClient } = await import("../src/appserver-client.mjs");
+    const probe = new AppServerClient({ bin: "zcode", log: () => {}, credentialsFile: path.join(tmp, "credentials.json") });
+    const keys = probe._codingPlanApiKeys();
+    assert.equal(keys["account-provider:coding-plan:account:bigmodel-account:account:1:api-key"], "sk-plan-key-123");
+
+    // keyHint 不匹配（secret 换过）→ 解不出；os 来源（钥匙串）→ 拒绝
+    const bad = new AppServerClient({ bin: "zcode", log: () => {}, credentialsFile: path.join(tmp, "credentials.json") });
+    fsMod.writeFileSync(path.join(tmp, "credential-secret"), "t".repeat(43));
+    assert.equal(Object.keys(bad._codingPlanApiKeys()).length, 0, "secret 变更后应解不出");
+    fsMod.writeFileSync(path.join(tmp, "credential-secret"), secret);
+    const osSrc = "enc:v2:os:" + hint + ":" + enc("x").split(":").pop();
+    assert.equal(probe._decryptCredential(osSrc), null, "os 来源不支持");
+
+    // v1 明文与 enc:v1 兼容不变
+    assert.equal(probe._decryptCredential("plain-key"), "plain-key");
   });
 
 

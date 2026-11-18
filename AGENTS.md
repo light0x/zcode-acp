@@ -24,6 +24,7 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 | `src/zcode-headless.mjs` | 无头驱动、CLI 命令/技能清单查询、sqlite 只读访问 |
 | `src/content.mjs` | part/content 翻译、命令表组装、工具标题、模式文案 |
 | `src/rpc.mjs` | LineRpc：行 JSON 通道（ACP 侧带 jsonrpc 封装，zcode 侧不带） |
+| `src/logging.mjs` | 带轮转的追加写日志（默认 `~/.zcode/cli/log`，单文件超 5MB 轮转 `.old`） |
 | `docs/` | zcode 协议快照与 ACP v2 参考文档 |
 
 ## 协议不变量（均有实证，改动前先读）
@@ -43,11 +44,13 @@ zcode-acp 把 zcode 接入 ACP（Agent Client Protocol）客户端：`initialize
 13. `session/list` 游标为不透明 base64url JSON `{offset}`，非法值回落第一页；无头桥接的本地 `acp_*` 会话仅在第一页合并。
 14. 权限门控随会话模式（实测矩阵）：**build 门控 medium/high（Write、Bash rm 逐次询问，无会话级记忆），edit 门控 high；yolo 与 guarded 均不门控任何操作**（guarded 名实不符，实测连 Bash 删除都自动放行）。适配器默认跟随 zcode 会话默认 build——即开箱在 Zed 弹权限审批；不得回退强制 yolo（那会使弹窗永不出现）。
 15. `interaction/requestPermission` 的 `options[].response` 是该选项的预制应答载荷：客户端选中后必须把对应 `response` 原样回传服务端（`allow_project` 携带 `permissionUpdates` 持久规则；kind `deny` 在 ACP 侧映射 `reject_once`）。服务端对未应答请求约 5s 超时后**以相同 requestId、逐字节相同的参数重发**——适配器按 `sessionId+requestId` 合并为一次客户端弹窗并广播应答；对已超时请求的迟到应答服务端忽略（实测无害）。v2 的 `session/request_permission` 主体字段名是 `subject.toolCall`（非 `toolCallUpdate`），Bash 类命令输入走 `type:"command"` 主体（command/cwd）。重发机制同样作用于 `interaction/requestUserInput`（提问）：适配器按 `sessionId+问题内容` 合并为一次 elicitation 弹窗并广播应答，否则无人值守时客户端反复弹窗（实测）。
+16. `turn.failed` 的 `payload.error` 是结构化对象（实录 `{type, message, code, underlyingErrorMessage, attribution}`；模型请求失败时 `message:"Model request failed."`，根因在 `underlyingErrorMessage`），**不是字符串**——原样放进 ACP `state_update.error.message` 会在 v1 线上拼成 `[error] [object Object]`（实测 `/init` 时 provider 流断即此形态）。桥接层以 `failureText` 提取 `message+code+underlyingErrorMessage` 可读文本，v1 方言层对非字符串 message 再作 JSON 化兜底。
+17. 凭据库 `~/.zcode/v2/credentials.json` 的值有两种加密格式（实测自 zcode 3.18.2 zcode.cjs）：`enc:v1:<iv>.<tag>.<data>`（key=sha256(env secret 或历史 fallback 推导)）与 **`enc:v2:<source>:<keyHint>:<iv>.<tag>.<data>`**（source∈`env`/`os`；key=sha256(secret)，keyHint=sha256(key).hex 前 24 位用于校验；env 的 secret 来源：`ZCODE_CREDENTIAL_SECRET` → `ZCODE_CREDENTIAL_SECRET_FILE` → credentials.json 同目录 `credential-secret` 文件（600 权限、32~4096 字节）；os 来源需系统钥匙串，适配器不支持返回 null）。zcode 换格式不解密会让密文被当 api-key 注入，模型请求报「Client signing requires an API Key」——解密逻辑收敛在 `decryptCredential`（appserver-client.mjs）单点维护。
 
 ## 测试
 
-- 每次改动必须全绿：`node test/appserver-unit-test.mjs && node test/unit-test.mjs && node test/v1-test.mjs`（不依赖网络与 zcode 进程）。
-- `test/*-e2e-test.mjs` 驱动真实 zcode（需已登录），重大链路改动再跑。
+- 每次改动必须全绿：`npm run test:unit`（即 `node test/unit-test.mjs && node test/v1-test.mjs && node test/appserver-unit-test.mjs`，不依赖网络与 zcode 进程）。
+- `test/*-e2e-test.mjs` 驱动真实 zcode（需已登录，`npm run test:e2e`），重大链路改动再跑。
 - 修复协议行为的改动必须带回归测试钉住线上形状（单测注入 FakeClient/PassThrough，不 mock 被测层）。
 - 协议夹具必须固化自实录流量（`ZCODE_ACP_PROTOCOL_LOG` 或一次性探针驱动真实 zcode），不得凭想象构造：`tool.updated` 的结果字段曾因夹具写成想象中的 `output`（实测为 `result`，含 `content` 与 `display.structuredPatch`）而测试全绿、线上输出从未送达。新增协议消费字段前先以探针核对 `docs/zcode-protocol-snapshot.md`。
 

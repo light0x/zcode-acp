@@ -19,7 +19,7 @@ import {
   resolveZcodeBin,
   paginateSessions,
 } from "./zcode-headless.mjs";
-import { AppServerClient } from "./appserver-client.mjs";
+import { AppServerClient, decryptCredential } from "./appserver-client.mjs";
 
 const MODE_VALUES = ["plan", "build", "edit", "yolo", "guarded"];
 const CATALOG_WAIT_MS = 4000;
@@ -620,7 +620,7 @@ export class AppServerBridge {
     if (/fail|error/.test(kind)) {
       this._endTurn(st.sessionId, {
         stopReason: "error",
-        error: { code: -32603, message: payload.error ?? payload.reason ?? `turn ${kind}` },
+        error: { code: -32603, message: failureText(payload) ?? `turn ${kind}` },
       });
     }
   }
@@ -792,8 +792,7 @@ export class AppServerBridge {
 
   // 从共享凭据库查 provider 的 api-key（键形如
   // account-provider:coding-plan:account:<providerId>:account:<账号>:api-key），mtime 变化即重读。
-  // 值为 `enc:v1:` 加密（aes-256-gcm），解密密钥与 CLI 一致：env secret，缺省按
-  // 平台/主目录/用户名派生的回退密钥（zcode 自身的 resolveCredentialSecret 行为）。
+  // 值为 enc:v1:/enc:v2: 加密，统一走 decryptCredential（appserver-client.mjs，与 CLI 算法一致）。
   _credentialsApiKey(providerId) {
     if (!providerId) return null;
     const short = providerId.replace(/^account:/, "");
@@ -823,21 +822,7 @@ export class AppServerBridge {
   }
 
   _decryptCredential(value) {
-    const PREFIX = "enc:v1:";
-    if (!value.startsWith(PREFIX)) return value;
-    const secret =
-      process.env.ZCODE_CREDENTIAL_SECRET?.trim() ||
-      `zcode-credential-fallback:${os.platform()}:${os.homedir()}:${os.userInfo().username}`;
-    const parts = value.slice(PREFIX.length).split(".");
-    if (parts.length !== 3) return null;
-    try {
-      const key = crypto.createHash("sha256").update(secret).digest();
-      const d = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(parts[0], "base64url"));
-      d.setAuthTag(Buffer.from(parts[1], "base64url"));
-      return Buffer.concat([d.update(Buffer.from(parts[2], "base64url")), d.final()]).toString();
-    } catch {
-      return null;
-    }
+    return decryptCredential(value, this._credentialsFile());
   }
 
   // ---------- 模型目录与配置选项 ----------
@@ -1053,4 +1038,25 @@ function mapStopReason(status) {
     default:
       return "error";
   }
+}
+
+// turn.failed 的 payload.error 是结构化对象（实测 {type:"AiSdkModelAdapterError",
+// message:"Model request failed.", code:"model_request_failed", underlyingErrorMessage?, …}，
+// 见 zcode.cjs zcodeTurnFailedEventPayloadSchema），原样进 message 会在 v1 线上
+// 拼成 "[object Object]"；此处提取可读文本（message + code + 根因），字符串形态与
+// payload.reason 兜底保留。
+function failureText(payload) {
+  const e = payload?.error;
+  if (typeof e === "string" && e) return e;
+  if (e && typeof e === "object") {
+    const msg = typeof e.message === "string" && e.message ? e.message : "";
+    const code = typeof e.code === "string" && e.code && e.code !== msg ? ` (${e.code})` : "";
+    const under =
+      typeof e.underlyingErrorMessage === "string" && e.underlyingErrorMessage && e.underlyingErrorMessage !== msg
+        ? `: ${e.underlyingErrorMessage}`
+        : "";
+    const text = `${msg || e.type || "unknown error"}${code}${under}`;
+    return text.trim() || null;
+  }
+  return typeof payload?.reason === "string" && payload.reason ? payload.reason : null;
 }

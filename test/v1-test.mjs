@@ -169,6 +169,24 @@ async function main() {
     assert.ok(errChunk, "missing error chunk");
   });
 
+  await test("错误 turn：error.message 为对象时 JSON 化出线，绝不显示 [object Object]", async () => {
+    // 防御钉住：桥接层已提取结构化错误文本（turn.failed payload.error），但任何漏网对象
+    // 到达 v1 方言层时必须 JSON 化（实测 /init 模型请求失败时 Zed 只见 [error] [object Object]）
+    const { client, bridge, variants } = makeEnv();
+    await initV1(client);
+    const { sessionId } = await withTimeout(client.request("session/new", { cwd: "/w" }), "new");
+    bridge._update(sessionId, {
+      sessionUpdate: "state_update",
+      state: "idle",
+      stopReason: "error",
+      error: { code: -32603, message: { type: "AiSdkModelAdapterError", message: "Model request failed." } },
+    });
+    const errChunk = variants("agent_message_chunk").find((w) => w.update.content.text.startsWith("[error]"));
+    assert.ok(errChunk, "missing error chunk");
+    assert.ok(!errChunk.update.content.text.includes("[object Object]"), "对象被拼成 [object Object]");
+    assert.ok(errChunk.update.content.text.includes("Model request failed."), "应含原始错误文本");
+  });
+
   await test("取消：session/cancel 后挂起的 prompt 以 stopReason 'cancelled' 收束", async () => {
     let rejectDone;
     const { client } = makeEnv({

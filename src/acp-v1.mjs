@@ -219,10 +219,12 @@ export class V1Dialect {
       case "state_update": {
         if (update.state !== "idle") return;
         if (update.stopReason === "error" && update.error?.message) {
-          // v1 没有 error 停止原因：错误文本作为消息分块送达，再以 end_turn 收束
+          // v1 没有 error 停止原因：错误文本作为消息分块送达，再以 end_turn 收束。
+          // message 非字符串时 JSON 化兜底，绝不让对象拼成 "[object Object]"
+          const m = update.error.message;
           this.agent.notifyUpdate(sessionId, {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `[error] ${update.error.message}` },
+            content: { type: "text", text: `[error] ${typeof m === "string" ? m : JSON.stringify(m)}` },
           });
         }
         const waiter = (this.pending.get(sessionId) ?? []).shift();

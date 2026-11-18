@@ -16,15 +16,85 @@ import { rotatingAppend } from "./logging.mjs";
 
 const REQUEST_TIMEOUT_MS = 30000;
 
+// 凭据库统一解密（AppServerClient 与 AppServerBridge 共用）：
+// - v1：enc:v1:<iv>.<tag>.<data>，key=sha256(env secret 或历史 fallback 推导)；
+// - v2：enc:v2:<source>:<keyHint>:<iv>.<tag>.<data>（实测自 zcode 3.18.2 zcode.cjs LTo/pvt/lEn），
+//   key=sha256(secret)，keyHint=sha256(key).hex 前 24 位；secret 来源 ZCODE_CREDENTIAL_SECRET →
+//   ZCODE_CREDENTIAL_SECRET_FILE → credentials.json 同目录 credential-secret 文件（600 权限，
+//   32~4096 字节）；os 来源依赖系统钥匙串，适配器不支持，返回 null。
+export function decryptCredential(value, credentialsFilePath) {
+  if (typeof value !== "string" || !value) return null;
+  if (!value.startsWith("enc:")) return value;
+  if (value.startsWith("enc:v2:")) return decryptCredentialV2(value.slice("enc:v2:".length), credentialsFilePath);
+  const PREFIX = "enc:v1:";
+  if (!value.startsWith(PREFIX)) return null;
+  const secret =
+    process.env.ZCODE_CREDENTIAL_SECRET?.trim() ||
+    `zcode-credential-fallback:${os.platform()}:${os.homedir()}:${os.userInfo().username}`;
+  const parts = value.slice(PREFIX.length).split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const key = crypto.createHash("sha256").update(secret).digest();
+    return aesGcmOpen(key, parts);
+  } catch {
+    return null;
+  }
+}
+
+function decryptCredentialV2(body, credentialsFilePath) {
+  const h = body.split(":");
+  if (h.length !== 3 || !h[0] || !h[1] || !h[2] || !["os", "env"].includes(h[0]) || !/^[a-f0-9]{24}$/.test(h[1])) return null;
+  if (h[0] !== "env") return null; // os 来源需系统钥匙串，无文件形态可解
+  if (process.env.ZCODE_CREDENTIAL_SECRET && process.env.ZCODE_CREDENTIAL_SECRET_FILE) return null;
+  let secret = process.env.ZCODE_CREDENTIAL_SECRET?.trim();
+  if (!secret && process.env.ZCODE_CREDENTIAL_SECRET_FILE) {
+    try {
+      secret = fs.readFileSync(process.env.ZCODE_CREDENTIAL_SECRET_FILE, "utf8");
+    } catch {
+      return null;
+    }
+  }
+  if (!secret) {
+    try {
+      const dir = path.dirname(credentialsFilePath ?? path.join(os.homedir(), ".zcode", "v2", "credentials.json"));
+      const file = path.join(dir, "credential-secret");
+      const st = fs.statSync(file);
+      if (!st.isFile() || (process.platform !== "win32" && st.mode & 0o777 !== 0o600)) return null;
+      secret = fs.readFileSync(file, "utf8");
+    } catch {
+      return null;
+    }
+  }
+  const bytes = Buffer.byteLength(secret, "utf8");
+  if (!secret || bytes < 32 || bytes > 4096) return null;
+  try {
+    const key = crypto.createHash("sha256").update(secret).digest();
+    const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+    if (hint !== h[1]) return null;
+    return aesGcmOpen(key, h[2].split("."));
+  } catch {
+    return null;
+  }
+}
+
+function aesGcmOpen(key, parts) {
+  if (parts.length !== 3) return null;
+  const [iv, tag, data] = parts.map((s) => Buffer.from(s, "base64url"));
+  const d = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  d.setAuthTag(tag);
+  return Buffer.concat([d.update(data), d.final()]).toString("utf8");
+}
+
 export class AppServerClient extends EventEmitter {
   // answer: async (method, params) => result 对象（interaction/requestPermission 等反向请求的应答）
   // protocolLog：非空时逐行记录 app-server 原始出入站流量（排障用）
-  constructor({ bin, cwd, log, answer, protocolLog } = {}) {
+  constructor({ bin, cwd, log, answer, protocolLog, credentialsFile } = {}) {
     super();
     this.bin = bin ?? resolveZcodeBin();
     this.cwd = cwd;
     this.log = log ?? (() => {});
     this.answer = answer ?? (() => ({}));
+    this.credentialsFile = credentialsFile;
     this.rpc = null; // 每次连接新建（见 _start）
     this.child = null;
     this.starting = null;
@@ -81,7 +151,10 @@ export class AppServerClient extends EventEmitter {
     try {
       const source = JSON.parse(fs.readFileSync(personalPath, "utf8"));
       const keys = this._codingPlanApiKeys();
-      if (!Object.keys(keys).length) return null;
+      if (!Object.keys(keys).length) {
+        this.log("coding-plan: 凭据库无可用套餐 api-key（未登录或 secret 不可解，运行 zcode login 后重启会话）");
+        return null;
+      }
       source.config ??= {};
       source.config.providerConfigRules ??= {};
       const rules = (source.config.providerConfigRules.providerRules ??= []);
@@ -147,8 +220,12 @@ export class AppServerClient extends EventEmitter {
   }
 
   // 凭据库中编码套餐 api-key 条目（键 → 解密后的明文 key）
+  _credentialsPath() {
+    return this.credentialsFile ?? this._credentialsFile?.() ?? path.join(os.homedir(), ".zcode", "v2", "credentials.json");
+  }
+
   _codingPlanApiKeys() {
-    const file = this._credentialsFile?.() ?? path.join(os.homedir(), ".zcode", "v2", "credentials.json");
+    const file = this._credentialsPath();
     let raw;
     try {
       raw = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -164,22 +241,9 @@ export class AppServerClient extends EventEmitter {
     return out;
   }
 
+  // 凭据解密：v1 与 v2 统一走 decryptCredential（见模块头）
   _decryptCredential(value) {
-    const PREFIX = "enc:v1:";
-    if (!value.startsWith(PREFIX)) return value;
-    const secret =
-      process.env.ZCODE_CREDENTIAL_SECRET?.trim() ||
-      `zcode-credential-fallback:${os.platform()}:${os.homedir()}:${os.userInfo().username}`;
-    const parts = value.slice(PREFIX.length).split(".");
-    if (parts.length !== 3) return null;
-    try {
-      const key = crypto.createHash("sha256").update(secret).digest();
-      const d = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(parts[0], "base64url"));
-      d.setAuthTag(Buffer.from(parts[1], "base64url"));
-      return Buffer.concat([d.update(Buffer.from(parts[2], "base64url")), d.final()]).toString();
-    } catch {
-      return null;
-    }
+    return decryptCredential(value, this._credentialsPath());
   }
 
   // 内置配置解析顺序：桌面运行期物化副本（取最新）→ 安装包内静态副本

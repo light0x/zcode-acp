@@ -12,7 +12,7 @@ Zed / ACP 客户端 ──ACP v1/v2 (stdio JSON-RPC 2.0)──> zcode-acp ──
 
 零 npm 依赖，仅需 Node.js ≥ 22（内置 `node:sqlite`）与已登录的 zcode（`zcode login`）。
 同一套代码跨平台：Linux / macOS / WSL 自动探测 `~/.zcode/server/bin/zcode`；
-Windows 自动探测桌面版内置 CLI（`%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`，用同一 Node 运行时执行）。
+Windows / macOS 自动探测桌面版内置 CLI（Windows `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`，macOS `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`，均用同一 Node 运行时执行）。
 
 ## 部署
 
@@ -31,15 +31,18 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 # 或直接双击 / 命令行运行 install.cmd
 ```
 
-脚本执行四步：检查 Node ≥ 22 → `npm install -g` 本仓库 → 运行 `--self-check`
-自检（解析 zcode 可执行文件与版本、会话库可读性）→ 打印本机的 Zed `agents.json`
-配置片段（绝对路径，与安装位置一致，直接复制即可）。
+脚本执行四步：检查 Node ≥ 22 → 打包 tarball（pnpm/npm `pack`，仓库根不落产物）→
+优先 `pnpm add -g`、否则 `npm install -g` 安装该 tarball（**快照副本，非仓库软链**：
+包管理器对本地目录安装会创建 link 依赖，tarball 安装则是独立副本，改动仓库后重跑脚本即升级）
+→ 运行 `--self-check` 自检（解析 zcode 可执行文件与版本、会话库可读性）→ 打印本机的
+Zed `agents.json` 配置片段（绝对路径，与安装位置一致，直接复制即可）。
 
 `--self-check` 也可随时单独运行排障：
 
 ```bash
-node "$(npm root -g)/zcode-acp/bin/zcode-acp.mjs" --self-check   # Unix
-node "%APPDATA%\npm\node_modules\zcode-acp\bin\zcode-acp.mjs" --self-check   # Windows
+zcode-acp --self-check   # 任意安装方式（安装后命令 shim 均在 PATH）
+node "$(npm root -g)/zcode-acp/bin/zcode-acp.mjs" --self-check   # npm 安装副本直跑（npm 布局入口路径稳定）
+node "%APPDATA%\npm\node_modules\zcode-acp\bin\zcode-acp.mjs" --self-check   # Windows（npm 安装）
 ```
 
 ### 手动安装（备用）
@@ -47,15 +50,21 @@ node "%APPDATA%\npm\node_modules\zcode-acp\bin\zcode-acp.mjs" --self-check   # W
 <details>
 <summary>不用脚本时按下面步骤操作</summary>
 
+一律从打包出的 tarball 安装（快照副本）；不要 `npm i -g ./目录` / `pnpm add -g ./目录`——
+那是仓库软链安装（`pnpm` 对本地目录按 `link:` 协议处理，等同 `pnpm link`）。
+
 ```bash
 # WSL / Linux / macOS
-npm pack                 # 生成 zcode-acp-<version>.tgz
-npm i -g ./zcode-acp-<version>.tgz
+npm pack                 # 生成 zcode-acp-<version>.tgz（或 pnpm pack --pack-destination .）
+npm i -g ./zcode-acp-<version>.tgz          # npm 全局：纯真实文件
+# 或 pnpm（优先推荐）：
+pnpm add -g ./zcode-acp-<version>.tgz       # 命令 shim 路径查 pnpm bin -g；安装位置查 pnpm root -g（pnpm ≥12 的包在其下哈希子目录 <hash>/node_modules/ 中，全局目录为指向内部虚拟 store 的软链，pnpm 标准布局）
 ```
 
 ```powershell
 # Windows
 npm i -g C:\path\to\zcode-acp-<version>.tgz
+# 或 pnpm：pnpm add -g C:\path\to\zcode-acp-<version>.tgz（shim 在 %LOCALAPPDATA%\pnpm）
 ```
 
 </details>
@@ -137,7 +146,8 @@ Windows 本地项目 → agent 在 Windows 跑）。因此"一份配置两端通
 - Windows 端探测桌面版内置 CLI、Linux 端探测 `~/.zcode/server/bin/zcode`，
   差异全部由适配器吸收，配置无需体现。
 - SSH 打开 Linux 项目时 agent 在远端执行——远端必须先跑一遍 Linux 侧安装与 `zcode login`。
-- Windows 上 npm shim 是 `zcode-acp.cmd`，Zed 按 PATH+PATHEXT 解析裸名即可命中；
+- Windows 上命令 shim 是 `zcode-acp.cmd`（npm 在 `%APPDATA%\npm`，pnpm 在 `%LOCALAPPDATA%\pnpm`），
+  Zed 按 PATH+PATHEXT 解析裸名即可命中；
   若个别 Zed 版本解析不到，把 `command` 改成 `"zcode-acp.cmd"`（唯一需要分叉的地方）。
 - Linux 端注意 nvm 的 PATH 陷阱：Zed remote server 由 sshd 拉起，非登录 shell 可能
   不含 `~/.nvm` 路径。建议系统级 Node 安装，或补一个链接：

@@ -412,6 +412,51 @@ async function main() {
     assert.equal(resolveZcodeBin("  /opt/trim/zcode  "), "/opt/trim/zcode");
   });
 
+  test("跨平台：桌面版内置 CLI 自动探测（darwin 候选优先于 server bin，win32 保持原序）", () => {
+    const app = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    const userApp = "/Users/u/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    const serverBin = "/Users/u/.zcode/server/bin/zcode";
+    // darwin：/Applications 桌面版命中
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: {}, exists: (p) => p === app }),
+      app,
+    );
+    // darwin：/Applications 缺失时回落 ~/Applications
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: {}, exists: (p) => p === userApp }),
+      userApp,
+    );
+    // darwin：无桌面安装时回落 ~/.zcode/server/bin/zcode，再缺省 PATH 的 zcode
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: {}, exists: (p) => p === serverBin }),
+      serverBin,
+    );
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: {}, exists: () => false }),
+      "zcode",
+    );
+    // darwin：ZCODE_BIN 仍优先于桌面候选
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: { ZCODE_BIN: "/custom/zcode" }, exists: () => true }),
+      "/custom/zcode",
+    );
+    // win32：LOCALAPPDATA 候选（原序保持），全缺时回落 zcode.exe
+    const winApp = "C:\\Users\\u\\AppData\\Local\\Programs\\ZCode\\resources\\glm\\zcode.cjs";
+    assert.equal(
+      resolveZcodeBin(undefined, {
+        platform: "win32",
+        home: "C:\\Users\\u",
+        env: { LOCALAPPDATA: "C:\\Users\\u\\AppData\\Local" },
+        exists: (p) => p === winApp,
+      }),
+      winApp,
+    );
+    assert.equal(
+      resolveZcodeBin(undefined, { platform: "win32", home: "C:\\Users\\u", env: {}, exists: () => false }),
+      "zcode.exe",
+    );
+  });
+
 
   await test("思考显示默认值：ZCODE_ACP_THINKING_DISPLAY=full 时新会话默认完整", async () => {
     const saved = process.env.ZCODE_ACP_THINKING_DISPLAY;

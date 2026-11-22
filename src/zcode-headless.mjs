@@ -2,32 +2,41 @@
 // 1. runPrompt —— spawn `zcode -p <text> --json`（每个 turn 一个进程），返回最终 JSON 结果；
 // 2. 会话存储只读访问 —— 从 zcode 的 sqlite（session/message/part 表）读会话列表与历史，
 //    支撑 ACP session/list 与 session/resume 历史回放。只读连接，不干扰 zcode 写入。
-// 跨平台：Linux/macOS/WSL 用 ~/.zcode/server/bin/zcode；Windows 用桌面版内置的
-// resources/glm/zcode.cjs（Node 脚本，与适配器共用同一个 node 运行时执行）。
+// 跨平台：Windows/macOS 优先探测桌面版内置的 resources/glm/zcode.cjs（Node 脚本，与适配器
+// 共用同一个 node 运行时执行）；Linux/WSL 及无桌面安装时回落 ~/.zcode/server/bin/zcode 或 PATH 的 zcode。
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-// Windows 桌面版内置 CLI 的候选位置（按优先级）
-const WINDOWS_CLI_CANDIDATES = [
-  () => path.join(process.env.LOCALAPPDATA ?? "", "Programs", "ZCode", "resources", "glm", "zcode.cjs"),
-  () => path.join(process.env.ProgramFiles ?? "C:\\Program Files", "ZCode", "resources", "glm", "zcode.cjs"),
-];
+// 桌面版内置 CLI 的候选位置（按优先级）：Windows / macOS 桌面版安装布局各自的资源目录。
+// 路径用各平台的固定分隔符构造（path.win32 / POSIX 字符串拼接），与运行适配器的宿主平台无关，
+// 便于单测注入 exists 精确比对。
+const DESKTOP_CLI_CANDIDATES = {
+  win32: [
+    (env) => path.win32.join(env.LOCALAPPDATA ?? "", "Programs", "ZCode", "resources", "glm", "zcode.cjs"),
+    (env) => path.win32.join(env.ProgramFiles ?? "C:\\Program Files", "ZCode", "resources", "glm", "zcode.cjs"),
+  ],
+  darwin: [
+    () => "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+    (env, home) => `${home}/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`,
+  ],
+};
 
-export function resolveZcodeBin(explicit) {
+// 显式参数 > ZCODE_BIN > 桌面版内置候选 > 平台缺省（win32: zcode.exe；其余: server bin / PATH 的 zcode）。
+// deps 可注入 exists/platform/home/env 便于单测（缺省取真实环境）。
+export function resolveZcodeBin(explicit, deps = {}) {
+  const { exists = fs.existsSync, platform = process.platform, home = os.homedir(), env = process.env } = deps;
   if (explicit && explicit.trim()) return explicit.trim();
-  if (process.env.ZCODE_BIN && process.env.ZCODE_BIN.trim()) return process.env.ZCODE_BIN.trim();
-  if (process.platform === "win32") {
-    for (const candidate of WINDOWS_CLI_CANDIDATES) {
-      const p = candidate();
-      if (p && fs.existsSync(p)) return p;
-    }
-    return "zcode.exe";
+  if (env.ZCODE_BIN && env.ZCODE_BIN.trim()) return env.ZCODE_BIN.trim();
+  for (const candidate of DESKTOP_CLI_CANDIDATES[platform] ?? []) {
+    const p = candidate(env, home);
+    if (p && exists(p)) return p;
   }
-  const fallback = path.join(os.homedir(), ".zcode", "server", "bin", "zcode");
-  if (fs.existsSync(fallback)) return fallback;
+  if (platform === "win32") return "zcode.exe";
+  const fallback = path.join(home, ".zcode", "server", "bin", "zcode");
+  if (exists(fallback)) return fallback;
   return "zcode";
 }
 

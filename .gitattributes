@@ -1,0 +1,3 @@
+# Windows 批处理文件必须以 CRLF 签出（cmd.exe 对 LF 行尾的解析有历史怪癖）；
+# 其余文件行尾不干预，遵循各自的 git 配置。
+*.cmd text eol=crlf

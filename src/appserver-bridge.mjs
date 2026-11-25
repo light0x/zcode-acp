@@ -19,7 +19,7 @@ import {
   resolveZcodeBin,
   paginateSessions,
 } from "./zcode-headless.mjs";
-import { AppServerClient, decryptCredential } from "./appserver-client.mjs";
+import { AppServerClient, decryptCredential, osCredentialKey } from "./appserver-client.mjs";
 
 const MODE_VALUES = ["plan", "build", "edit", "yolo", "guarded"];
 const CATALOG_WAIT_MS = 4000;
@@ -46,6 +46,7 @@ export class AppServerBridge {
     this.credentialsPath =
       deps.credentialsPath ?? path.join(os.homedir(), ".zcode", "v2", "credentials.json");
     this._credentialsCache = null; // { at, map }
+    this._osCredentialKey = osCredentialKey; // 可注入替身（测试）
     this._listSessions = listSessions;
     this._readHistory = readHistory;
     this._getModelSelection = getSessionModelSelection;
@@ -360,11 +361,22 @@ export class AppServerBridge {
   async _attach(st) {
     if (!st.zcodeId) st.zcodeId = st.sessionId;
     if (st.gen === this.client.generation && this.client.child) return;
-    const client = await this._client();
-    const r = await client.request("session/resume", {
-      sessionId: st.sessionId,
-      ...(st.cwd ? { workspace: { workspacePath: st.cwd, workspaceKey: st.cwd } } : {}),
+    // 同一会话的并发重挂合并为一次（空会话顶替的 session/create 不幂等）
+    st.attaching ??= this._reattach(st).finally(() => {
+      st.attaching = null;
     });
+    return st.attaching;
+  }
+
+  async _reattach(st) {
+    const client = await this._client();
+    const workspace = st.cwd ? { workspacePath: st.cwd, workspaceKey: st.cwd } : undefined;
+    let r;
+    try {
+      r = await client.request("session/resume", { sessionId: st.sessionId, ...(workspace ? { workspace } : {}) });
+    } catch (resumeErr) {
+      r = await this._reviveVacantSession(client, st, resumeErr);
+    }
     // 先并目录再采纳模型：_adoptModel 从目录条目兜底 contextWindow（usage_update 的 size 必填）
     if (Array.isArray(r?.settings?.model?.available) && r.settings.model.available.length) {
       this.catalog = this._mergeCatalog(this.catalog, r.settings.model.available);
@@ -401,6 +413,32 @@ export class AppServerBridge {
     if (Array.isArray(r?.slashCommands) && r.slashCommands.length) st.serverSlashCommands = r.slashCommands;
     await client.request("session/subscribe", { sessionId: st.sessionId, deliveryKind: "desktop-continuous" });
     st.gen = client.generation;
+  }
+
+  // session/resume 失败后的兜底。zcode 以延迟持久化创建会话：未发过消息的空会话不在会话库中，
+  // 换进程后 resume 即被 project.session-lineage-invalid 拒绝（实测，Windows/Linux 4.0.0 一致）；
+  // 而 Zed 在 session/new 应答后即保存线程，之后会经新连接对它 session/load（实测），面板显示 Failed to
+  // Launch。此时以同一 sessionId 重新 session/create 顶替：无历史可丢，会话 ID 不变。服务端拒绝已存在的
+  // ID（sessionId already exists），故真实会话（归属其他工作区、已删除）不会被顶替。无头后端的 acp_* 本地 ID 不在此列。
+  async _reviveVacantSession(client, st, resumeErr) {
+    if (!st.sessionId.startsWith("sess_") || !st.cwd) throw resumeErr;
+    const workspace = { workspacePath: st.cwd, workspaceKey: st.cwd };
+    try {
+      const r = await client.request("session/create", { sessionId: st.sessionId, workspace }, 120000);
+      this.log(`session/resume failed for ${st.sessionId} (${resumeErr?.message ?? resumeErr}); recreated as an empty session`);
+      return r;
+    } catch (createErr) {
+      // 仅当归属校验失败且 ID 仍被占用，才说明会话真实存在却无法在当前工作区激活；
+      // 其余情形（resume 因进程崩溃等失败、create 被拒）原样抛出 resume 错误
+      const lineage = /session-lineage-invalid/.test(resumeErr?.message ?? "");
+      if (!lineage || !/sessionId already exists/.test(createErr?.message ?? "")) throw resumeErr;
+      throw Object.assign(
+        new Error(
+          `cannot resume zcode session ${st.sessionId} in this workspace: it belongs to another directory or was deleted. Open it from its original directory, or start a new thread`,
+        ),
+        { code: resumeErr?.code ?? -32603 },
+      );
+    }
   }
 
   _state(sessionId) {
@@ -743,7 +781,7 @@ export class AppServerBridge {
     }
     if (method === "interaction/requestProviderRuntimeHeaders") {
       // 账号型 provider（如 GLM 编码套餐）的鉴权：从共享凭据库取对应 api-key
-      const apiKey = this._credentialsApiKey(params?.providerId);
+      const apiKey = await this._credentialsApiKey(params?.providerId);
       if (apiKey) return { headersApplied: true, requestAuth: { apiKey } };
       return { headersApplied: false };
     }
@@ -793,7 +831,7 @@ export class AppServerBridge {
   // 从共享凭据库查 provider 的 api-key（键形如
   // account-provider:coding-plan:account:<providerId>:account:<账号>:api-key），mtime 变化即重读。
   // 值为 enc:v1:/enc:v2: 加密，统一走 decryptCredential（appserver-client.mjs，与 CLI 算法一致）。
-  _credentialsApiKey(providerId) {
+  async _credentialsApiKey(providerId) {
     if (!providerId) return null;
     const short = providerId.replace(/^account:/, "");
     const file = this._credentialsFile();
@@ -810,7 +848,7 @@ export class AppServerBridge {
     for (const [k, v] of Object.entries(cache.raw ?? {})) {
       if (!k.includes(`:${short}:`) || !k.endsWith(":api-key")) continue;
       if (typeof v !== "string" || !v) continue;
-      const plain = this._decryptCredential(v);
+      const plain = await this._decryptCredential(v);
       if (plain === null) continue;
       try {
         const parsed = JSON.parse(plain);
@@ -821,8 +859,10 @@ export class AppServerBridge {
     return null;
   }
 
-  _decryptCredential(value) {
-    return decryptCredential(value, this._credentialsFile());
+  async _decryptCredential(value) {
+    const file = this._credentialsFile();
+    const osKey = typeof value === "string" && value.startsWith("enc:v2:os:") ? await this._osCredentialKey(file, this.log) : null;
+    return decryptCredential(value, file, osKey);
   }
 
   // ---------- 模型目录与配置选项 ----------

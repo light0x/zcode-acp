@@ -1,6 +1,7 @@
 ﻿# zcode-acp 一键安装（Windows）：
 #   1. 检查 Node.js >= 22（zcode 桌面版内置 CLI 与本适配器都需要 Node 运行时）
-#   2. 打包 tarball，pnpm 优先全局安装（快照副本，非仓库软链——包管理器对本地目录安装会创建 link，tarball 安装则是快照）
+#   2. 打包 tarball，pnpm 优先全局安装（快照副本，非仓库软链——包管理器对本地目录安装会创建 link，tarball 安装则是快照），
+#      并移除另一包管理器全局的旧副本——只保留一种安装
 #   3. 运行自检（解析 zcode、会话库）
 #   4. 打印本机的 Zed agents.json 配置片段
 # 用法：git clone 本仓库后，在仓库根目录执行
@@ -36,6 +37,43 @@ function Show-SourceCommit {
   } finally {
     $ErrorActionPreference = $savedEap
   }
+}
+
+# 单一安装收敛：移除另一包管理器全局的 zcode-acp 旧副本，PATH 上只保留本次安装的 shim。
+# 包目录已删而 shim 残留（孤儿）时卸载命令是空操作，故卸载后再按文件名清扫。
+function Remove-StaleCopy($other) {
+  if ($other -eq "npm") {
+    $root = NativeLine { npm root -g }
+    $binDir = NativeLine { npm prefix -g }
+    $uninstall = { npm uninstall -g zcode-acp }
+    $manual = "npm uninstall -g zcode-acp"
+    $present = $root -and (Test-Path (Join-Path $root "zcode-acp"))
+  } else {
+    $root = NativeLine { pnpm root -g }
+    $binDir = NativeLine { pnpm bin -g }
+    $uninstall = { pnpm remove -g zcode-acp }
+    $manual = "pnpm remove -g zcode-acp"
+    # pnpm ≥12 的包在哈希子目录 <root>\<hash>\node_modules 下
+    $present = $root -and ((Test-Path (Join-Path $root "zcode-acp")) -or (Test-Path (Join-Path $root "*\node_modules\zcode-acp")))
+  }
+  $shims = @()
+  if ($binDir) {
+    $shims = @("zcode-acp", "zcode-acp.cmd", "zcode-acp.ps1") | ForEach-Object { Join-Path $binDir $_ } | Where-Object { Test-Path $_ -PathType Leaf }
+  }
+  if (-not $present -and -not $shims) { return }
+  $savedEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    if ($present) {
+      & $uninstall 2>$null | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        Warn "无法移除 $other 全局的 zcode-acp 旧副本，请手动执行：$manual（避免 PATH 上 shim 互相遮蔽）"
+        return
+      }
+    }
+    $shims | ForEach-Object { Remove-Item $_ -Force -ErrorAction SilentlyContinue }
+    Ok "removed $other 全局的 zcode-acp 旧副本（只保留 $pm 这一种安装）"
+  } finally { $ErrorActionPreference = $savedEap }
 }
 
 Say "zcode-acp 安装（Windows / $env:PROCESSOR_ARCHITECTURE）"
@@ -119,19 +157,9 @@ try {
     Ok "installed（快照不随仓库变动；升级重跑 install.ps1）"
   }
 
-  # 残留双装检查：另一包管理器全局还留有旧副本时，PATH 上 shim 会互相遮蔽
-  if ($pm -ne "npm" -and (Get-Command npm -ErrorAction SilentlyContinue)) {
-    $npmRoot = NativeLine { npm root -g }
-    if ($npmRoot -and (Test-Path (Join-Path $npmRoot "zcode-acp"))) {
-      Warn "npm 全局仍装有 zcode-acp（旧副本），建议 npm uninstall -g zcode-acp 后重跑，避免 PATH shim 冲突"
-    }
-  }
-  if ($pm -ne "pnpm" -and (Get-Command pnpm -ErrorAction SilentlyContinue)) {
-    $pnpmRoot = NativeLine { pnpm root -g }
-    if ($pnpmRoot -and (Test-Path (Join-Path $pnpmRoot "zcode-acp"))) {
-      Warn "pnpm 全局仍装有 zcode-acp（旧副本），建议 pnpm rm -g zcode-acp 后重跑，避免 PATH shim 冲突"
-    }
-  }
+  # 单一安装：另一包管理器全局的旧副本直接移除，PATH 上只保留本次安装的 shim
+  if ($pm -ne "npm" -and (Get-Command npm -ErrorAction SilentlyContinue)) { Remove-StaleCopy "npm" }
+  if ($pm -ne "pnpm" -and (Get-Command pnpm -ErrorAction SilentlyContinue)) { Remove-StaleCopy "pnpm" }
 } finally {
   $ErrorActionPreference = $savedEap
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

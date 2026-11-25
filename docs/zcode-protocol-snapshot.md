@@ -17,14 +17,14 @@
 
 | 方法 | 参数 | 结果 | 备注 |
 | --- | --- | --- | --- |
-| `session/create` | `{workspace: {workspacePath, workspaceKey}}` | `{session: {sessionId, mode, model: {providerId, modelId, options?}}, projection: {contextWindow, mode, status, …}, protocol}` | sessionKind/title 不是 create 参数；`projection` 另含 `contextUsed`/`totalTokenCount`（实测即当前上下文占用，与上轮 `turn.completed.usage.totalTokens` 一致）——resume 响应同形携带，可用于恢复会话立即出线 usage_update |
+| `session/create` | `{workspace: {workspacePath, workspaceKey}, sessionId?}` | `{session: {sessionId, mode, model: {providerId, modelId, options?}}, projection: {contextWindow, mode, status, …}, protocol}` | sessionKind/title 不是 create 参数；`projection` 另含 `contextUsed`/`totalTokenCount`（实测即当前上下文占用，与上轮 `turn.completed.usage.totalTokens` 一致）——resume 响应同形携带，可用于恢复会话立即出线 usage_update。`sessionId` 可由客户端指定（非空字符串即可；内存或库中已存在则 `-32602 sessionId already exists`，实测 4.0.0）。会话以**延迟持久化**创建：未发过消息的空会话不落库，首个 prompt 才写入 |
 | `session/subscribe` | `{sessionId, deliveryKind: "desktop-continuous" \| "web-remote-replayable"}` | `{}` | 订阅后才开始收 `session/event` |
 | `session/send` | `{sessionId, content: string}` | `{accepted: true, sessionId, stateRevision}` | 异步受理；turn 事件随后推送 |
 | `session/stop` | `{sessionId}` | `{}` | 取消当前 turn |
 | `session/setMode` | `{sessionId, mode: "build"\|"edit"\|"plan"\|"yolo"\|"guarded"}` | 投影 | yolo 下不再产生权限请求 |
 | `session/setModel` | `{sessionId, model: {providerId, modelId, options?: {reasoningLevel}}}` | 投影 | 模型带 reasoning.levels 时该档位必填；不支持 `ref` 包装 |
 | `session/setThoughtLevel` | `{sessionId, thoughtLevel}` | 投影 | 单独设思考档位 |
-| `session/resume` | `{sessionId, workspace?}` | `{messages: [...], session: {mode, model}, projection, runtime, settings, slashCommands}` | 可跨进程重挂已持久化会话，响应自带历史；**不回填持久化模式**——换进程后 `session.mode`/`projection.mode` 恒为默认 build（实测），模式持久化在 sqlite `session_entry` 的 `runtime/execution_state`（`{"mode":"edit","planEnabled":false}`，setMode 时落盘），客户端须自行读取并 `session/setMode` 恢复。**占用来源**：`runtime.contextUsage.{used,size}` 权威（压缩会话跨进程 resume 仍有正确值）；`projection.contextUsed` 在压缩会话换进程后恒为 0（实测，未压缩会话正常），不可单独依赖 |
+| `session/resume` | `{sessionId, workspace?}` | `{messages: [...], session: {mode, model}, projection, runtime, settings, slashCommands}` | 可跨进程重挂已持久化会话，响应自带历史；**不回填持久化模式**——换进程后 `session.mode`/`projection.mode` 恒为默认 build（实测），模式持久化在 sqlite `session_entry` 的 `runtime/execution_state`（`{"mode":"edit","planEnabled":false}`，setMode 时落盘），客户端须自行读取并 `session/setMode` 恢复。**占用来源**：`runtime.contextUsage.{used,size}` 权威（压缩会话跨进程 resume 仍有正确值）；`projection.contextUsed` 在压缩会话换进程后恒为 0（实测，未压缩会话正常），不可单独依赖。**失败形状**：会话在当前进程查无可用记录（未落盘的空会话）或与所带 workspace 不匹配时，应答 `-32603 project.session-lineage-invalid`，`data` 为序列化的 Error `{name, stack}`（实测 Windows/Linux 4.0.0）——空会话由适配器以同一 `sessionId` 重新 `session/create` 顶替 |
 | `session/read` / `session/messages` | `{sessionId}` | `{messages: [...]}` | 历史读取 |
 | `session/list` | `{}` | `{sessions: [{sessionId, mode, status, title, sessionKind, updatedAt, …}]}` | |
 | `session/usage` | `{sessionId}` | `{totalTokens, inputTokens, outputTokens, reasoningTokens, cacheCreationTokens, cacheReadTokens, modelRequestCount, modelErrorCount, inputBaselineBySource}` | **计费累计统计**：totalTokens 是累计消耗而非当前上下文占用，不可用作 usage_update.used |
@@ -69,4 +69,4 @@
 - 会话持久化与桌面端共享同一 sqlite 存储：适配器 `session/list` 与历史回放继续走只读 sqlite
   （`~/.zcode/cli/db/db.sqlite`），`session/resume` 走协议重挂。
 - 服务端请求 15s 超时（`Mnt=15e3`）；权限请求的观察窗口未测得超时，桌面端交互式等待可用。
-- 凭据库 `~/.zcode/v2/credentials.json` 值加密两格式（实测 zcode 3.18.2）：`enc:v1:<iv>.<tag>.<data>`（key=sha256(env secret 或 fallback 推导)）；`enc:v2:<source>:<keyHint>:<iv>.<tag>.<data>`（source∈env/os，key=sha256(secret)，keyHint=sha256(key).hex[0:24]，env secret 取 `ZCODE_CREDENTIAL_SECRET` → secret file env → credentials.json 同目录 `credential-secret`（600/32-4096B），os 需钥匙串）。编码套餐 api-key 键形如 `account-provider:coding-plan:account:<base>:account:<id>:api-key`。
+- 凭据库 `~/.zcode/v2/credentials.json` 值加密两格式（实测 zcode 3.18.2）：`enc:v1:<iv>.<tag>.<data>`（key=sha256(env secret 或 fallback 推导)）；`enc:v2:<source>:<keyHint>:<iv>.<tag>.<data>`（source∈env/os，key=sha256(secret)，keyHint=sha256(key).hex[0:24]，env secret 取 `ZCODE_CREDENTIAL_SECRET` → secret file env → credentials.json 同目录 `credential-secret`（600/32-4096B）；os 的 key 取自系统钥匙串：service `ZCode Credential Encryption`、user 为 credentials.json 绝对路径的 sha256 hex、条目值 base64url(key)，经可选依赖 `@napi-rs/keyring` 读取）。编码套餐 api-key 键形如 `account-provider:coding-plan:account:<base>:account:<id>:api-key`。

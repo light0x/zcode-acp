@@ -415,7 +415,8 @@ async function main() {
   test("跨平台：桌面版内置 CLI 自动探测（darwin 候选优先于 server bin，win32 保持原序）", () => {
     const app = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
     const userApp = "/Users/u/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
-    const serverBin = "/Users/u/.zcode/server/bin/zcode";
+    // 回落路径由实现经 path.join 构造，期望值同样构造，使断言与宿主平台分隔符无关
+    const serverBin = path.join("/Users/u", ".zcode", "server", "bin", "zcode");
     // darwin：/Applications 桌面版命中
     assert.equal(
       resolveZcodeBin(undefined, { platform: "darwin", home: "/Users/u", env: {}, exists: (p) => p === app }),

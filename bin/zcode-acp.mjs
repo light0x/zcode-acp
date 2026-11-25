@@ -64,6 +64,7 @@ async function selfCheck() {
   if (major < 22) problems.push(`Node.js >= 22 required (built-in node:sqlite), got v${process.versions.node}`);
 
   const { resolveZcodeBin } = await import("../src/zcode-headless.mjs");
+  const { usesOsSource } = await import("../src/appserver-client.mjs");
   const bin = resolveZcodeBin();
   const { command, baseArgs } = zcodeCommand(bin);
   const known = baseArgs.length > 0 || /^[\\/]|^zcode/.test(command);
@@ -71,6 +72,16 @@ async function selfCheck() {
     problems.push(`zcode not found (tried ZCODE_BIN, platform defaults, PATH)`);
   }
   console.log(`zcode bin: ${bin}`);
+
+  // os 来源凭据（桌面版迁移到系统钥匙串后）依赖可选依赖 @napi-rs/keyring：凭据库用到时才检查并报告，
+  // 缺失不阻断安装——仅编码套餐 key 不可解，其余 provider 照常
+  if (usesOsSource(path.join(os.homedir(), ".zcode", "v2", "credentials.json"))) {
+    const state = await import("@napi-rs/keyring").then(
+      () => "ok",
+      (err) => `unavailable (${err?.code ?? err?.message ?? err}); coding-plan credentials cannot be decrypted, reinstall to fetch @napi-rs/keyring`,
+    );
+    console.log(`credential keyring (os source): ${state}`);
+  }
 
   // 实际拉起一次 zcode --version 确认可执行（cjs 入口时用当前 node）
   if (problems.length === 0) {

@@ -10,7 +10,8 @@ Zed / ACP 客户端 ──ACP v1/v2 (stdio JSON-RPC 2.0)──> zcode-acp ──
                                                       └──只读──> ~/.zcode/cli/db/db.sqlite（会话列表与历史回放）
 ```
 
-零 npm 依赖，仅需 Node.js ≥ 22（内置 `node:sqlite`）与已登录的 zcode（`zcode login`）。
+运行时仅一个可选 npm 依赖 `@napi-rs/keyring`（读取系统钥匙串中的编码套餐凭据；未装或平台不支持时仅该凭据来源不可解，其余功能照常），
+另需 Node.js ≥ 22（内置 `node:sqlite`）与已登录的 zcode（`zcode login`）。
 同一套代码跨平台：Linux / macOS / WSL 自动探测 `~/.zcode/server/bin/zcode`；
 Windows / macOS 自动探测桌面版内置 CLI（Windows `%LOCALAPPDATA%\Programs\ZCode\resources\glm\zcode.cjs`，macOS `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`，均用同一 Node 运行时执行）。
 
@@ -33,8 +34,9 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 脚本执行四步：检查 Node ≥ 22 → 打包 tarball（pnpm/npm `pack`，仓库根不落产物）→
 优先 `pnpm add -g`、否则 `npm install -g` 安装该 tarball（**快照副本，非仓库软链**：
-包管理器对本地目录安装会创建 link 依赖，tarball 安装则是独立副本，改动仓库后重跑脚本即升级）
-→ 运行 `--self-check` 自检（解析 zcode 可执行文件与版本、会话库可读性）→ 打印本机的
+包管理器对本地目录安装会创建 link 依赖，tarball 安装则是独立副本，改动仓库后重跑脚本即升级；
+另一包管理器全局的旧副本随之移除，始终只保留一种安装）
+→ 运行 `--self-check` 自检（解析 zcode 可执行文件与版本、会话库可读性；凭据库用到系统钥匙串时一并报告钥匙串依赖是否可用）→ 打印本机的
 Zed `agents.json` 配置片段（绝对路径，与安装位置一致，直接复制即可）。
 
 `--self-check` 也可随时单独运行排障：
@@ -178,6 +180,9 @@ Windows 与 WSL 各有一套 zcode 安装（各自 `~/.zcode` 的登录态、配
 
 ## 快速开始（直接运行，不装包）
 
+仓库直接运行时，若编码套餐凭据已被桌面版迁入系统钥匙串（适配器日志 `credential keyring unavailable`），
+先在仓库目录执行 `pnpm install`（或 `npm install`）装入可选依赖 `@napi-rs/keyring`；文件型凭据环境不需要。
+
 ```jsonc
 // Zed（~/.config/zed/agents.json）
 [
@@ -275,7 +280,11 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 `session/list` 返回同一命名空间，均可用于 `session/resume`。
 
 进程模型：适配器持有一个常驻 app-server 子进程，崩溃后自动重启并以 `session/resume` 重挂活跃会话
-（连接代数守卫，避免重复重挂）。app-server 启动硬性要求成对的内置/个人 provider 配置路径——
+（连接代数守卫，避免重复重挂）。zcode 以延迟持久化创建会话，未发过消息的空会话不在会话库中，
+跨进程 `session/resume` 会被 `project.session-lineage-invalid` 拒绝（Zed 保存线程后会经新连接
+`session/load`，面板显示 Failed to Launch）——此时适配器以同一 sessionId 重新 `session/create` 顶替，
+会话 ID 不变且无历史可丢；真实会话受服务端 ID 唯一性校验保护不会被顶替，改为返回可读错误。
+app-server 启动硬性要求成对的内置/个人 provider 配置路径——
 桌面 ZCode 通过环境变量传入，独立环境（如 Zed）由适配器自动探测注入：优先 `~/.zcode/v2/runtime/provider/`
 下最新的运行期物化副本，回退安装包内静态副本（`resources/config/provider/zcode-builtin.json`），
 个人配置缺省 `~/.zcode/v2/provider_config.json`。协议细节见
@@ -286,7 +295,7 @@ v1 差异的吸收方式：turn 出错时错误文本以消息分块送达、`st
 | 能力 | 状态 | 实现方式 |
 | --- | --- | --- |
 | session（new/prompt/cancel/resume/list/close/set_config_option） | ✅ | ACP 七个基线方法全实现；会话与历史读写 app-server 协议 + sqlite 会话存储 |
-| 模型 / 思考强度 | ✅ | 全量目录来自 `session/create` 的 `settings.model.available` 快照，`state.updated` 补丁按 model 合并更新当前 provider 的可用集；`zcode.model` / `zcode.reasoning` 两个 config option 映射 `session/setModel`，v1 客户端经 `session/set_config_option` 同样可用。编码套餐账号通道（`account:*-coding-plan`）仅桌面上下文物化——适配器按官方「启动器从受控凭据来源写入临时配置」模式（usage/03-config.md），将凭据库解密的套餐 key 以 `personalModelIds` 形态注入临时个人配置副本（`~/.zcode/cli/zcode-acp-provider-config.json`），使套餐 GLM 模型在独立会话可选 |
+| 模型 / 思考强度 | ✅ | 全量目录来自 `session/create` 的 `settings.model.available` 快照，`state.updated` 补丁按 model 合并更新当前 provider 的可用集；`zcode.model` / `zcode.reasoning` 两个 config option 映射 `session/setModel`，v1 客户端经 `session/set_config_option` 同样可用。编码套餐账号通道（`account:*-coding-plan`）仅桌面上下文物化——适配器按官方「启动器从受控凭据来源写入临时配置」模式（usage/03-config.md），将凭据库解密的套餐 key 以 `personalModelIds` 形态注入临时个人配置副本（`~/.zcode/cli/zcode-acp-provider-config.json`），使套餐 GLM 模型在独立会话可选。注入清单随内置目录中该账号通道的 `builtinModelIds`（不是白名单，目录新增的模型自动出现；用户 `modelOrder` 只决定排序），过滤只有黑名单——桌面端对该账号通道禁用的模型（`enabled:false`，内置目录的缺省可被用户规则覆盖）同样不出现 |
 | 流式输出 | ✅ | app-server：`model.streaming` 的 `text_delta` / `reasoning_delta` 逐字翻译为 `agent_message_chunk` / `agent_thought_chunk`（思考流出线受 `zcode.thinking_display` 控制，默认精简）；无头回退后端经官方 `--output-format stream-json` 事件同样逐字流式 |
 | 权限交互 | ✅ | 默认 build 模式：副作用/高风险工具触发 `interaction/requestPermission` → ACP `session/request_permission`（Zed 弹窗，Allow once / Always allow / Deny）→ 选中选项的 response 载荷回传（Always 含持久规则）；约 5s 未应答服务端重发，适配器合并为单弹窗；yolo/guarded 模式不触发审批（实测 guarded 不拦截），可用 config option 切换 |
 | command（斜杠命令） | ✅ | `session/new`/`resume` 返回 `availableCommands`：内置命令（`/compact`、`/skill`）+ `commands list` 的自定义/插件命令（含参数 hint）；用户输入的 `"/name args"` 原样透传（`/compact`、`/skill`、插件命令均已验证生效） |
@@ -343,3 +352,4 @@ docs/zcode-protocol-snapshot.md  ZCode Protocol 逆向快照（由测试钉住�
 - 同一会话的 turn 串行排队执行；不同会话并行。
 - TUI 专属斜杠命令（`/new` `/mode` `/model` `/fork` `/rewind` 等）不适用；对应能力由 ACP 方法（config option、resume）与 `interaction/requestOfficialMcpAuthHeaders` 之外的反向请求覆盖。
 - `interaction/requestOfficialMcpAuthHeaders` 反向请求暂以空对象应答（官方 MCP 鉴权头待补）。
+- 编码套餐凭据为 `enc:v2:os`（桌面版迁移到系统钥匙串后，Windows 桌面版即如此）时经可选依赖 `@napi-rs/keyring` 读取钥匙串：依赖未装、平台不支持或系统无钥匙串服务（如未启用 Secret Service 的 WSL）时这部分凭据不可解，套餐模型不出现（适配器日志 `credential keyring unavailable`，`zcode-acp --self-check` 会报告），个人 provider 不受影响。

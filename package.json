@@ -14,6 +14,9 @@
   "engines": {
     "node": ">=22"
   },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "^2.1.2"
+  },
   "scripts": {
     "test": "node test/unit-test.mjs && node test/v1-test.mjs && node test/appserver-unit-test.mjs && node test/e2e-test.mjs && node test/v1-e2e-test.mjs && node test/appserver-e2e-test.mjs",
     "test:unit": "node test/unit-test.mjs && node test/v1-test.mjs && node test/appserver-unit-test.mjs",

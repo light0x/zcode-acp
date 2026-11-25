@@ -19,13 +19,15 @@ const REQUEST_TIMEOUT_MS = 30000;
 // 凭据库统一解密（AppServerClient 与 AppServerBridge 共用）：
 // - v1：enc:v1:<iv>.<tag>.<data>，key=sha256(env secret 或历史 fallback 推导)；
 // - v2：enc:v2:<source>:<keyHint>:<iv>.<tag>.<data>（实测自 zcode 3.18.2 zcode.cjs LTo/pvt/lEn），
-//   key=sha256(secret)，keyHint=sha256(key).hex 前 24 位；secret 来源 ZCODE_CREDENTIAL_SECRET →
-//   ZCODE_CREDENTIAL_SECRET_FILE → credentials.json 同目录 credential-secret 文件（600 权限，
-//   32~4096 字节）；os 来源依赖系统钥匙串，适配器不支持，返回 null。
-export function decryptCredential(value, credentialsFilePath) {
+//   keyHint=sha256(key).hex 前 24 位。env 来源 key=sha256(secret)，secret 取 ZCODE_CREDENTIAL_SECRET →
+//   ZCODE_CREDENTIAL_SECRET_FILE → credentials.json 同目录 credential-secret 文件（600 权限、32~4096 字节）；
+//   os 来源 key 即系统钥匙串条目的内容，由 osCredentialKey 异步读入后经 osKey 传入，未传入则不可解。
+export function decryptCredential(value, credentialsFilePath, osKey = null) {
   if (typeof value !== "string" || !value) return null;
   if (!value.startsWith("enc:")) return value;
-  if (value.startsWith("enc:v2:")) return decryptCredentialV2(value.slice("enc:v2:".length), credentialsFilePath);
+  if (value.startsWith("enc:v2:")) {
+    return decryptCredentialV2(value.slice("enc:v2:".length), credentialsFilePath, osKey);
+  }
   const PREFIX = "enc:v1:";
   if (!value.startsWith(PREFIX)) return null;
   const secret =
@@ -41,10 +43,53 @@ export function decryptCredential(value, credentialsFilePath) {
   }
 }
 
-function decryptCredentialV2(body, credentialsFilePath) {
+// os 来源的解密密钥存于系统钥匙串（逆向自 zcode 4.0.0 zcode.cjs）：条目 service 固定为
+// "ZCode Credential Encryption"，user 为 credentials.json 绝对路径的 sha256 hex，值为 base64url(32 字节 key)。
+// 经可选依赖 @napi-rs/keyring 读取；依赖缺失、平台不支持或条目不存在时解析为 null（仅 os 来源凭据不可解）。
+// 命中结果按文件缓存，未命中不缓存——凭据库之后迁入钥匙串仍可重试。
+const OS_KEYRING_SERVICE = "ZCode Credential Encryption";
+const osKeyCache = new Map();
+
+export function osCredentialKey(credentialsFilePath, log) {
+  const file = path.resolve(credentialsFilePath);
+  let pending = osKeyCache.get(file);
+  if (!pending) {
+    pending = import("@napi-rs/keyring")
+      .then(({ AsyncEntry }) => {
+        const user = crypto.createHash("sha256").update(file).digest("hex");
+        return new AsyncEntry(OS_KEYRING_SERVICE, user, { linux: { store: "secret-service" } }).getPassword();
+      })
+      .then((stored) => {
+        const key = Buffer.from(typeof stored === "string" ? stored : "", "base64url");
+        return key.length === 32 ? key : null;
+      })
+      .catch((err) => {
+        log?.(`credential keyring unavailable: ${err?.message ?? err}`);
+        return null;
+      });
+    osKeyCache.set(file, pending);
+    pending.then((key) => {
+      if (!key) osKeyCache.delete(file);
+    });
+  }
+  return pending;
+}
+
+// 凭据库是否含 os 来源的值——仅此时才需要（也才去）读取系统钥匙串
+export function usesOsSource(credentialsFilePath) {
+  try {
+    return Object.values(JSON.parse(fs.readFileSync(credentialsFilePath, "utf8"))).some(
+      (v) => typeof v === "string" && v.startsWith("enc:v2:os:"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function decryptCredentialV2(body, credentialsFilePath, osKey) {
   const h = body.split(":");
   if (h.length !== 3 || !h[0] || !h[1] || !h[2] || !["os", "env"].includes(h[0]) || !/^[a-f0-9]{24}$/.test(h[1])) return null;
-  if (h[0] !== "env") return null; // os 来源需系统钥匙串，无文件形态可解
+  if (h[0] === "os") return openV2(osKey, h);
   if (process.env.ZCODE_CREDENTIAL_SECRET && process.env.ZCODE_CREDENTIAL_SECRET_FILE) return null;
   let secret = process.env.ZCODE_CREDENTIAL_SECRET?.trim();
   if (!secret && process.env.ZCODE_CREDENTIAL_SECRET_FILE) {
@@ -67,11 +112,16 @@ function decryptCredentialV2(body, credentialsFilePath) {
   }
   const bytes = Buffer.byteLength(secret, "utf8");
   if (!secret || bytes < 32 || bytes > 4096) return null;
+  return openV2(crypto.createHash("sha256").update(secret).digest(), h);
+}
+
+// 以 key 打开 v2 载荷 [<source>, <keyHint>, <iv>.<tag>.<data>]；keyHint 不匹配（密钥已轮换）视为不可解
+function openV2(key, [, keyHint, blob]) {
+  if (!key?.length) return null;
+  const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+  if (hint !== keyHint) return null;
   try {
-    const key = crypto.createHash("sha256").update(secret).digest();
-    const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
-    if (hint !== h[1]) return null;
-    return aesGcmOpen(key, h[2].split("."));
+    return aesGcmOpen(key, blob.split("."));
   } catch {
     return null;
   }
@@ -85,16 +135,46 @@ function aesGcmOpen(key, parts) {
   return Buffer.concat([d.update(data), d.final()]).toString("utf8");
 }
 
+// 编码套餐注入 provider 的模型清单。成员不是白名单：随内置目录的 builtinModelIds 走，账号通道的 modelOrder
+// 只是排序偏好（排在前面），目录新增的模型（如 3.19.1 起的 GLM-5.4）自动出现；过滤只有黑名单 disabled。
+export function codingPlanModelIds(modelOrder, builtinModelIds, disabled = []) {
+  const out = [];
+  const hidden = new Set(disabled);
+  for (const id of [...(modelOrder ?? []), ...(builtinModelIds ?? [])]) {
+    if (typeof id === "string" && id && !hidden.has(id) && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+// 账号通道被禁用的模型：内置目录的 builtinProviderModelRules 给出缺省，用户的 providerModelRules 覆盖，
+// 两处都没有规则的模型默认启用。
+export function disabledModelIds(builtinConfig, userConfig, providerId) {
+  const enabled = new Map();
+  for (const rules of [
+    builtinConfig?.modelConfigRules?.builtinProviderModelRules,
+    userConfig?.modelConfigRules?.providerModelRules,
+  ]) {
+    for (const r of rules ?? []) {
+      if (r?.providerId === providerId && typeof r.config?.enabled === "boolean") enabled.set(r.modelId, r.config.enabled);
+    }
+  }
+  return [...enabled].filter(([, on]) => !on).map(([id]) => id);
+}
+
 export class AppServerClient extends EventEmitter {
   // answer: async (method, params) => result 对象（interaction/requestPermission 等反向请求的应答）
   // protocolLog：非空时逐行记录 app-server 原始出入站流量（排障用）
-  constructor({ bin, cwd, log, answer, protocolLog, credentialsFile } = {}) {
+  // injectedProviderConfig：注入副本的落盘路径（缺省 ~/.zcode/cli/zcode-acp-provider-config.json）
+  constructor({ bin, cwd, log, answer, protocolLog, credentialsFile, injectedProviderConfig } = {}) {
     super();
     this.bin = bin ?? resolveZcodeBin();
     this.cwd = cwd;
     this.log = log ?? (() => {});
     this.answer = answer ?? (() => ({}));
     this.credentialsFile = credentialsFile;
+    this.injectedProviderConfig = injectedProviderConfig;
+    this.osKey = null; // os 来源凭据的钥匙串密钥（32 字节），启动 app-server 前按需读入
+    this._osCredentialKey = osCredentialKey; // 可注入替身（测试）
     this.rpc = null; // 每次连接新建（见 _start）
     this.child = null;
     this.starting = null;
@@ -139,15 +219,29 @@ export class AppServerClient extends EventEmitter {
     // 形态写入临时个人配置副本，使 GLM 模型在任意上下文可选。
     const personalPath = out.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE ?? personalFromEnv;
     if (personalPath) {
-      const injected = this._injectCodingPlanProvider(personalPath);
+      const injected = this._injectCodingPlanProvider(
+        personalPath,
+        out.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+      );
       if (injected) out.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = injected;
     }
     return out;
   }
 
+  // 内置目录的 config（zcode-builtin.json → config）；目录缺失或不可读时为空对象，
+  // 注入退回仅按用户 modelOrder 列出模型
+  _builtinProviderConfig(builtinPath) {
+    try {
+      const config = JSON.parse(fs.readFileSync(builtinPath, "utf8")).config;
+      return config && typeof config === "object" ? config : {};
+    } catch {
+      return {};
+    }
+  }
+
   // 读取用户个人配置，合并编码套餐 provider（凭据库解密出套餐 api-key），
   // 写入适配器拥有的副本文件；失败时回退用户原配置。返回副本路径或 null。
-  _injectCodingPlanProvider(personalPath) {
+  _injectCodingPlanProvider(personalPath, builtinPath) {
     try {
       const source = JSON.parse(fs.readFileSync(personalPath, "utf8"));
       const keys = this._codingPlanApiKeys();
@@ -158,21 +252,28 @@ export class AppServerClient extends EventEmitter {
       source.config ??= {};
       source.config.providerConfigRules ??= {};
       const rules = (source.config.providerConfigRules.providerRules ??= []);
-      const families = new Map(); // base id → { key, modelOrder? }
+      const builtin = this._builtinProviderConfig(builtinPath);
+      const families = new Map(); // base id → { key, modelIds }
       for (const [credKey, credValue] of Object.entries(keys)) {
         const m = credKey.match(/^account-provider:coding-plan:account:([^:]+):account:\d+:api-key$/);
         if (!m) continue;
         const base = m[1].replace(/^account:/, "");
         const providerId = `${base.split("-")[0]}-coding-plan`;
-        const accountEntry = rules.find((r) => r.providerId === `account:${m[1]}`);
+        const accountId = `account:${m[1]}`;
+        const accountEntry = rules.find((r) => r.providerId === accountId);
+        const builtinEntry = builtin.providerConfigRules?.providerRules?.find((r) => r.providerId === accountId);
         families.set(providerId, {
           apiKey: credValue,
-          modelOrder: accountEntry?.config?.modelOrder ?? [],
+          modelIds: codingPlanModelIds(
+            accountEntry?.config?.modelOrder,
+            builtinEntry?.config?.builtinModelIds,
+            disabledModelIds(builtin, source.config, accountId),
+          ),
         });
       }
       if (!families.size) return null;
       let changed = false;
-      for (const [providerId, { apiKey, modelOrder }] of families) {
+      for (const [providerId, { apiKey, modelIds }] of families) {
         const existing = rules.find(
           (r) => r.providerId === providerId && r.config?.access?.type === "api-key",
         );
@@ -196,7 +297,7 @@ export class AppServerClient extends EventEmitter {
             group: "standard-personal",
             access: { type: "api-key", apiKey },
             api: endpoints[family] ?? { type: "openai-chat-completions" },
-            ...(modelOrder.length ? { personalModelIds: modelOrder } : {}),
+            ...(modelIds.length ? { personalModelIds: modelIds } : {}),
           },
         });
         changed = true;
@@ -209,7 +310,8 @@ export class AppServerClient extends EventEmitter {
         order.push(...families.keys());
         changed = true;
       }
-      const outFile = path.join(os.homedir(), ".zcode", "cli", "zcode-acp-provider-config.json");
+      const outFile =
+        this.injectedProviderConfig ?? path.join(os.homedir(), ".zcode", "cli", "zcode-acp-provider-config.json");
       fs.mkdirSync(path.dirname(outFile), { recursive: true });
       fs.writeFileSync(outFile, JSON.stringify(source, null, 1));
       return outFile;
@@ -241,9 +343,15 @@ export class AppServerClient extends EventEmitter {
     return out;
   }
 
-  // 凭据解密：v1 与 v2 统一走 decryptCredential（见模块头）
+  // 凭据解密：v1 与 v2 统一走 decryptCredential（见模块头），os 来源带上已读入的钥匙串密钥
   _decryptCredential(value) {
-    return decryptCredential(value, this._credentialsPath());
+    return decryptCredential(value, this._credentialsPath(), this.osKey);
+  }
+
+  // 凭据库含 os 来源的值时读取系统钥匙串密钥，否则不触碰钥匙串
+  async _loadOsKey() {
+    const file = this._credentialsPath();
+    this.osKey = usesOsSource(file) ? await this._osCredentialKey(file, this.log) : null;
   }
 
   // 内置配置解析顺序：桌面运行期物化副本（取最新）→ 安装包内静态副本
@@ -299,6 +407,7 @@ export class AppServerClient extends EventEmitter {
 
   async _start() {
     const { command, baseArgs } = zcodeCommand(this.bin);
+    await this._loadOsKey();
     const child = spawn(command, [...baseArgs, "app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, NO_COLOR: "1", ...this._providerEnv() },

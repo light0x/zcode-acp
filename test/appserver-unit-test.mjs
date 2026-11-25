@@ -55,6 +55,18 @@ const CATALOG = [
   },
 ];
 
+// 实录夹具（zcode 4.0.0，Windows/Linux 一致）：新进程 session/resume 一个未落盘的空会话时的失败应答。
+// zcode 以延迟持久化创建会话，未发过消息的空会话不在会话库中；data 是序列化的 Error（name + stack）
+const vacantResumeError = () =>
+  Object.assign(new Error("project.session-lineage-invalid"), {
+    code: -32603,
+    data: {
+      name: "Error",
+      stack:
+        "Error: project.session-lineage-invalid\n    at validateSessionActivationWorkspace (C:\\Users\\u\\AppData\\Local\\Programs\\ZCode\\resources\\glm\\zcode.cjs:1571:55536)",
+    },
+  });
+
 // 假协议客户端：实现桥接依赖的 ensure/request/on/generation/child 接口
 class FakeClient extends EventEmitter {
   constructor() {
@@ -1004,6 +1016,157 @@ async function main() {
     assert.equal(r2.configOptions.find((o) => o.configId === "zcode.mode").currentValue, "guarded");
   });
 
+  // 空会话（未落盘）场景的假服务端：resume 一律被拒，create 接受客户端指定的 sessionId
+  // （应答形状取自实录 session/create：session.mode 为默认 build、settings 为全量目录快照）
+  const vacantServer = (client, { async: lazy = false } = {}) => {
+    client.handlers.set("session/subscribe", {});
+    client.handlers.set("session/resume", async () => {
+      if (lazy) await sleep(20);
+      throw vacantResumeError();
+    });
+    client.handlers.set("session/create", async (params) => {
+      if (lazy) await sleep(20);
+      client.state({ model: { available: CATALOG } });
+      return {
+        session: { sessionId: params.sessionId, mode: "build", model: { providerId: "prov-a", modelId: "model-x" } },
+        projection: { contextWindow: 128000, contextUsed: 0, status: "idle" },
+        settings: { model: { available: CATALOG } },
+        slashCommands: [{ name: "goal", description: "Set or advance the session goal.", inputHint: "/goal <objective>" }],
+      };
+    });
+  };
+
+  await test("resume：空会话换进程后被拒（延迟持久化），以同 ID session/create 顶替", async () => {
+    const { bridge, client, sent } = makeBridge();
+    vacantServer(client);
+    bridge._readHistory = async () => [];
+    bridge._getModelSelection = async () => null;
+    bridge._getExecutionMode = async () => null;
+    const r = await bridge.resume({ sessionId: "sess_empty", cwd: "/w" });
+    const create = client.requests.filter((x) => x.method === "session/create");
+    assert.equal(create.length, 1, "应以同 ID 重新建会话");
+    assert.deepEqual(create[0].params, { sessionId: "sess_empty", workspace: { workspacePath: "/w", workspaceKey: "/w" } });
+    assert.ok(
+      client.requests.some((x) => x.method === "session/subscribe" && x.params.sessionId === "sess_empty"),
+      "顶替后应订阅事件流",
+    );
+    assert.ok(!client.requests.some((x) => x.method === "session/setMode"), "空会话无持久化模式，不应 setMode");
+    assert.equal(r.configOptions.find((o) => o.configId === "zcode.mode").currentValue, "build");
+    assert.equal(r.configOptions.find((o) => o.configId === "zcode.model").options.length, CATALOG.length);
+    assert.ok(r.availableCommands.some((c) => c.name === "goal"), "命令表取自顶替应答的 slashCommands");
+    assert.ok(sent.some((s) => s.sessionId === "sess_empty" && s.update.sessionUpdate === "state_update" && s.update.state === "idle"));
+
+    // 同代内后续调用不再重挂
+    await bridge.setConfigOption({ sessionId: "sess_empty", configId: "zcode.thinking_display", value: "full" });
+    assert.equal(client.requests.filter((x) => x.method === "session/resume").length, 1);
+    assert.equal(client.requests.filter((x) => x.method === "session/create").length, 1);
+  });
+
+  await test("resume：同一空会话的并发重挂合并为一次顶替（session/create 不幂等）", async () => {
+    const { bridge, client } = makeBridge();
+    vacantServer(client, { async: true });
+    bridge._readHistory = async () => [];
+    bridge._getModelSelection = async () => null;
+    bridge._getExecutionMode = async () => null;
+    await bridge.resume({ sessionId: "sess_empty", cwd: "/w" });
+    // app-server 再次重启：空会话仍未落盘，两个并发调用同时触发重挂
+    client.gen += 1;
+    await Promise.all([
+      bridge.setConfigOption({ sessionId: "sess_empty", configId: "zcode.thinking_display", value: "full" }),
+      bridge.setConfigOption({ sessionId: "sess_empty", configId: "zcode.thinking_display", value: "concise" }),
+    ]);
+    const count = (m) => client.requests.filter((x) => x.method === m).length;
+    assert.equal(count("session/resume"), 2, "每代各重挂一次");
+    assert.equal(count("session/create"), 2, "每代各顶替一次，并发不重复");
+  });
+
+  await test("resume：真实会话归属不符时不顶替（同 ID create 被拒），抛可读错误", async () => {
+    const { bridge, client } = makeBridge();
+    const cause = vacantResumeError();
+    client.handlers.set("session/resume", () => {
+      throw cause;
+    });
+    // 实录：已落盘会话在错误工作区 resume 被拒后，同 ID session/create 应答 -32602 sessionId already exists
+    client.handlers.set("session/create", () => {
+      throw Object.assign(new Error("sessionId already exists"), { code: -32602 });
+    });
+    const err = await bridge.resume({ sessionId: "sess_other", cwd: "/w" }).catch((e) => e);
+    assert.match(err.message, /^cannot resume zcode session sess_other in this workspace: it belongs to another directory or was deleted/);
+    assert.equal(err.code, -32603);
+    assert.equal(err.data, undefined, "不向客户端透出服务端调用栈");
+    assert.ok(!client.requests.some((x) => x.method === "session/subscribe"), "顶替失败不应订阅");
+
+    // 无头后端的 acp_* 本地 ID 不顶替，原样抛出 resume 错误
+    const legacy = makeBridge();
+    legacy.client.handlers.set("session/resume", () => {
+      throw cause;
+    });
+    legacy.client.handlers.set("session/create", () => {
+      throw new Error("must not create");
+    });
+    const err2 = await legacy.bridge.resume({ sessionId: "acp_legacy", cwd: "/w" }).catch((e) => e);
+    assert.equal(err2, cause);
+    assert.ok(!legacy.client.requests.some((x) => x.method === "session/create"));
+
+    // resume 因进程崩溃失败（非归属校验），同 ID create 被拒时原样抛出 resume 错误，不套用归属提示
+    const crashed = makeBridge();
+    const exitErr = Object.assign(new Error("app-server exited (code 1) while request pending"), { code: -32603 });
+    crashed.client.handlers.set("session/resume", () => {
+      throw exitErr;
+    });
+    crashed.client.handlers.set("session/create", () => {
+      throw Object.assign(new Error("sessionId already exists"), { code: -32602 });
+    });
+    const err3 = await crashed.bridge.resume({ sessionId: "sess_crash", cwd: "/w" }).catch((e) => e);
+    assert.equal(err3, exitErr);
+  });
+
+  await test("v1 session/load：空会话顶替后返回完整 modes/configOptions；归属不符时线上为可读错误", async () => {
+    const client = new FakeClient();
+    vacantServer(client);
+    const acp = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (sessionId, update) => acp.sendUpdate(sessionId, update), log: () => {}, client }),
+      log: () => {},
+    });
+    acp.bridge._readHistory = async () => [];
+    acp.bridge._getModelSelection = async () => null;
+    acp.bridge._getExecutionMode = async () => null;
+    const toAgent = new PassThrough();
+    const toClient = new PassThrough();
+    acp.attach(toAgent, toClient);
+    const clientRpc = new LineRpc({ withJsonRpc: true });
+    clientRpc.attach(toClient, toAgent);
+    await clientRpc.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const lr = await clientRpc.request("session/load", { sessionId: "sess_empty", cwd: "/w" });
+    assert.equal(lr.modes?.currentModeId, "build");
+    assert.deepEqual(lr.configOptions.map((o) => o.id), ["zcode.mode", "zcode.model", "zcode.reasoning", "zcode.thinking_display"]);
+
+    // 归属不符：LineRpc 以线上 error 对象拒绝 promise，应只有 code + message（Zed 面板原样显示 message）
+    const client2 = new FakeClient();
+    client2.handlers.set("session/resume", () => {
+      throw vacantResumeError();
+    });
+    client2.handlers.set("session/create", () => {
+      throw Object.assign(new Error("sessionId already exists"), { code: -32602 });
+    });
+    const acp2 = new AcpAgent({
+      bridge: new AppServerBridge({ sendUpdate: (sessionId, update) => acp2.sendUpdate(sessionId, update), log: () => {}, client: client2 }),
+      log: () => {},
+    });
+    const toAgent2 = new PassThrough();
+    const toClient2 = new PassThrough();
+    acp2.attach(toAgent2, toClient2);
+    const clientRpc2 = new LineRpc({ withJsonRpc: true });
+    clientRpc2.attach(toClient2, toAgent2);
+    await clientRpc2.request("initialize", { protocolVersion: 1, clientCapabilities: {} });
+    const wire = await clientRpc2.request("session/load", { sessionId: "sess_other", cwd: "/w" }).catch((e) => e);
+    assert.equal(wire.code, -32603);
+    assert.match(wire.message, /^cannot resume zcode session sess_other in this workspace/);
+    assert.equal(wire.data, undefined, "线上错误不带服务端调用栈");
+    acp.rpc.output.destroy();
+    acp2.rpc.output.destroy();
+  });
+
   await test("连接换代：gen 变化后 prompt 触发 session/resume 重挂", async () => {
     const { bridge, client, sent } = makeBridge();
     const { sessionId } = await bridge.createNew({ cwd: "/w" });
@@ -1047,13 +1210,20 @@ async function main() {
       probe._locateBuiltinProviderConfig(path.join(tmp, "nonexistent")),
       path.join(binDir, "..", "config", "provider", "zcode-builtin.json"),
     );
-    // env 已设置时返回空对象（桌面上下文继承，不覆盖）
-    const saved = { b: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, p: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE };
+    // env 已设置时返回空对象（桌面上下文继承，不覆盖）。BASE_URL 同样置为已设置：
+    // 缺省时 _providerEnv 会按设计补后端地址，断言不应依赖宿主是否带有桌面注入的环境
+    const saved = {
+      b: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE,
+      p: process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE,
+      u: process.env.ZCODE_BASE_URL,
+    };
     process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = "x";
     process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = "y";
+    process.env.ZCODE_BASE_URL = "https://zcode.z.ai";
     assert.deepEqual(probe._providerEnv(), {});
     process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = saved.b;
     process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = saved.p;
+    process.env.ZCODE_BASE_URL = saved.u;
   });
 
   await test("凭据解密：enc:v2:env（key=sha256(secret 文件)，keyHint 校验）与 v1 兼容、os 来源拒绝", async () => {
@@ -1091,11 +1261,232 @@ async function main() {
     fsMod.writeFileSync(path.join(tmp, "credential-secret"), "t".repeat(43));
     assert.equal(Object.keys(bad._codingPlanApiKeys()).length, 0, "secret 变更后应解不出");
     fsMod.writeFileSync(path.join(tmp, "credential-secret"), secret);
+    // 来源标记必须与密钥来源一致：env 密钥不得解开标为 os 的值
     const osSrc = "enc:v2:os:" + hint + ":" + enc("x").split(":").pop();
-    assert.equal(probe._decryptCredential(osSrc), null, "os 来源不支持");
+    assert.equal(probe._decryptCredential(osSrc), null, "env 密钥不得解开 os 来源的值");
 
     // v1 明文与 enc:v1 兼容不变
     assert.equal(probe._decryptCredential("plain-key"), "plain-key");
+  });
+
+  // 构造 os 来源凭据（载荷形状取自实录 enc:v2:os:<keyHint>:<iv>.<tag>.<data>，iv 12 字节、tag 16 字节、AES-256-GCM）
+  async function makeOsCredential() {
+    const crypto = await import("node:crypto");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fsMod = await import("node:fs");
+    const key = crypto.randomBytes(32);
+    const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+    const value = (() => {
+      const iv = crypto.randomBytes(12);
+      const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+      const data = Buffer.concat([c.update("sk-plan-key-123", "utf8"), c.final()]);
+      return `enc:v2:os:${hint}:${[iv, c.getAuthTag(), data].map((b) => b.toString("base64url")).join(".")}`;
+    })();
+    const tmp = fsMod.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-os-"));
+    const credentialsFile = path.join(tmp, "credentials.json");
+    return { key, value, tmp, credentialsFile };
+  }
+
+  await test("凭据解密：os 来源以钥匙串密钥（32 字节）解开，keyHint 不匹配视为不可解", async () => {
+    const { decryptCredential, usesOsSource } = await import("../src/appserver-client.mjs");
+    const crypto = await import("node:crypto");
+    const fsMod = await import("node:fs");
+    const { key, value, tmp, credentialsFile } = await makeOsCredential();
+    assert.equal(decryptCredential(value, credentialsFile), null, "未提供钥匙串密钥时不可解");
+    assert.equal(decryptCredential(value, credentialsFile, crypto.randomBytes(32)), null, "密钥不匹配不可解");
+    assert.equal(decryptCredential(value, credentialsFile, Buffer.alloc(16)), null, "密钥长度不是 32 字节");
+    assert.equal(decryptCredential(value, credentialsFile, key), "sk-plan-key-123");
+    assert.equal(usesOsSource(path.join(tmp, "missing.json")), false);
+    fsMod.writeFileSync(credentialsFile, JSON.stringify({ a: "enc:v2:env:x:y.z" }));
+    assert.equal(usesOsSource(credentialsFile), false);
+    fsMod.writeFileSync(credentialsFile, JSON.stringify({ a: value }));
+    assert.equal(usesOsSource(credentialsFile), true);
+  });
+
+  await test("os 来源套餐 key：客户端启动前读入钥匙串密钥；反向请求鉴权同样可取（密钥不可用则 headersApplied:false）", async () => {
+    const { AppServerClient } = await import("../src/appserver-client.mjs");
+    const fsMod = await import("node:fs");
+    const path = await import("node:path");
+    const { key, value, tmp, credentialsFile } = await makeOsCredential();
+    const keyName = "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:1:api-key";
+    fsMod.writeFileSync(credentialsFile, JSON.stringify({ [keyName]: value }));
+
+    // 客户端：_codingPlanApiKeys 是同步的，钥匙串密钥须在 _start 前经 _loadOsKey 读入
+    const probe = new AppServerClient({ bin: "zcode", log: () => {}, credentialsFile });
+    let loads = 0;
+    probe._osCredentialKey = async () => {
+      loads++;
+      return key;
+    };
+    assert.deepEqual(probe._codingPlanApiKeys(), {}, "未读入密钥前解不出");
+    await probe._loadOsKey();
+    assert.equal(loads, 1);
+    assert.deepEqual(probe._codingPlanApiKeys(), { [keyName]: "sk-plan-key-123" });
+    // 凭据库无 os 来源值时不触碰钥匙串
+    fsMod.writeFileSync(credentialsFile, JSON.stringify({ [keyName]: "plain-key" }));
+    const plain = new AppServerClient({ bin: "zcode", log: () => {}, credentialsFile });
+    let plainLoads = 0;
+    plain._osCredentialKey = async () => {
+      plainLoads++;
+      return key;
+    };
+    await plain._loadOsKey();
+    assert.equal(plainLoads, 0);
+    assert.deepEqual(plain._codingPlanApiKeys(), { [keyName]: "plain-key" });
+    fsMod.writeFileSync(credentialsFile, JSON.stringify({ [keyName]: value }));
+
+    // 桥接：桌面上下文的凭据库路径取自 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 同目录
+    const saved = process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = path.join(tmp, "provider_config.json");
+    try {
+      const mk = (loader) => {
+        const bridge = new AppServerBridge({ sendUpdate: () => {}, log: () => {}, client: new FakeClient(), credentialsPath: credentialsFile });
+        bridge._osCredentialKey = loader;
+        return bridge;
+      };
+      const providerId = "account:bigmodel-individual-coding-plan";
+      const found = mk(async () => key);
+      assert.deepEqual(await found._answerServer("interaction/requestProviderRuntimeHeaders", { providerId }), {
+        headersApplied: true,
+        requestAuth: { apiKey: "sk-plan-key-123" },
+      });
+      let asked = 0;
+      const missing = mk(async () => {
+        asked++;
+        return null;
+      });
+      assert.deepEqual(await missing._answerServer("interaction/requestProviderRuntimeHeaders", { providerId }), {
+        headersApplied: false,
+      });
+      assert.equal(asked, 1, "os 来源值才读钥匙串");
+      const other = mk(async () => {
+        asked++;
+        return key;
+      });
+      fsMod.writeFileSync(credentialsFile, JSON.stringify({ [keyName]: "enc:v1:aaaa.bbbb.cccc" }));
+      assert.deepEqual(await other._answerServer("interaction/requestProviderRuntimeHeaders", { providerId }), {
+        headersApplied: false,
+      });
+      assert.equal(asked, 1, "非 os 来源的值不触碰钥匙串");
+    } finally {
+      if (saved === undefined) delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+      else process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = saved;
+    }
+  });
+
+  await test("coding-plan 注入：成员随内置目录（非白名单），过滤只有黑名单 enabled:false", async () => {
+    const { AppServerClient, codingPlanModelIds, disabledModelIds } = await import("../src/appserver-client.mjs");
+    // 纯函数：用户排序在前，目录其余模型按目录顺序追加并去重；黑名单只做减法
+    assert.deepEqual(
+      codingPlanModelIds(["GLM-5.3-Flash", "GLM-5.3"], ["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash"]),
+      ["GLM-5.3-Flash", "GLM-5.3", "GLM-5.4"],
+    );
+    assert.deepEqual(codingPlanModelIds(undefined, undefined), []);
+    assert.deepEqual(codingPlanModelIds(["GLM-5.3-Flash", "GLM-5.3"], ["GLM-5.4"], ["GLM-5.3"]), ["GLM-5.3-Flash", "GLM-5.4"]);
+    // 禁用规则：内置目录的 builtinProviderModelRules 给出缺省，用户的 providerModelRules 覆盖，无规则的模型启用
+    const accountId = "account:bigmodel-account";
+    const builtinDisabled = {
+      modelConfigRules: { builtinProviderModelRules: [{ providerId: accountId, modelId: "GLM-5.3-Flash", config: { enabled: false } }] },
+    };
+    assert.deepEqual(disabledModelIds(builtinDisabled, undefined, accountId), ["GLM-5.3-Flash"]);
+    assert.deepEqual(
+      disabledModelIds(builtinDisabled, {
+        modelConfigRules: {
+          providerModelRules: [
+            { providerId: accountId, modelId: "GLM-5.3-Flash", config: { enabled: true } },
+            { providerId: accountId, modelId: "GLM-5.3", config: { enabled: false } },
+            { providerId: "bigmodel-standard-api", modelId: "GLM-5.3-Flash", config: { enabled: false } },
+          ],
+        },
+      }, accountId),
+      ["GLM-5.3"],
+      "用户重新启用覆盖内置缺省；别的 provider 的规则不相关",
+    );
+
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const fsMod = await import("node:fs");
+    const crypto = await import("node:crypto");
+    const tmp = fsMod.mkdtempSync(path.join(os.tmpdir(), "zcode-acp-plan-"));
+    const secret = "s".repeat(43);
+    fsMod.writeFileSync(path.join(tmp, "credential-secret"), secret);
+    const key = crypto.createHash("sha256").update(secret).digest();
+    const hint = crypto.createHash("sha256").update(key).digest("hex").slice(0, 24);
+    const enc = (plain) => {
+      const iv = crypto.randomBytes(12);
+      const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+      const data = Buffer.concat([c.update(plain, "utf8"), c.final()]);
+      return `enc:v2:env:${hint}:${iv.toString("base64url")}.${c.getAuthTag().toString("base64url")}.${data.toString("base64url")}`;
+    };
+    const credentialsFile = path.join(tmp, "credentials.json");
+    fsMod.writeFileSync(
+      credentialsFile,
+      JSON.stringify({ "account-provider:coding-plan:account:bigmodel-account:account:1:api-key": enc("sk-plan-key-123") }),
+    );
+    const personalPath = path.join(tmp, "provider_config.json");
+    // 个人配置形状取自实录 provider_config.json：账号通道只有 modelOrder（排序偏好），禁用规则在 modelConfigRules
+    const writePersonal = (modelRules) =>
+      fsMod.writeFileSync(
+        personalPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          config: {
+            providerOrder: [],
+            providerConfigRules: {
+              providerRules: [{ providerId: "account:bigmodel-account", config: { modelOrder: ["GLM-5.3-Flash", "GLM-5.3"] } }],
+            },
+            modelConfigRules: { providerModelRules: modelRules, manualProviderModelRules: [] },
+          },
+        }),
+      );
+    writePersonal([]);
+    // 内置目录条目形状取自实录 zcode-builtin.json（4.0.0）：账号通道以 builtinModelIds 声明模型成员
+    const builtinPath = path.join(tmp, "zcode-builtin.json");
+    const writeBuiltin = (builtinModelRules) =>
+      fsMod.writeFileSync(
+        builtinPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          revision: "r",
+          config: {
+            providerConfigRules: {
+              providerRules: [
+                {
+                  providerId: "account:bigmodel-account",
+                  providerName: "BigModel Individual Coding Plan",
+                  config: { group: "bigmodel-family", builtinModelIds: ["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash"] },
+                },
+              ],
+            },
+            modelConfigRules: { builtinProviderModelRules: builtinModelRules },
+          },
+        }),
+      );
+    writeBuiltin([]);
+    const outFile = path.join(tmp, "zcode-acp-provider-config.json");
+    const probe = new AppServerClient({ bin: "zcode", log: () => {}, credentialsFile, injectedProviderConfig: outFile });
+    const planRule = () =>
+      JSON.parse(fsMod.readFileSync(outFile, "utf8")).config.providerConfigRules.providerRules.find(
+        (r) => r.providerId === "bigmodel-coding-plan",
+      );
+    const inject = () => {
+      assert.equal(probe._injectCodingPlanProvider(personalPath, builtinPath), outFile);
+      return planRule().config.personalModelIds;
+    };
+    // 三种情形经真实 app-server 核对过（probe-blacklist）：无规则全量、用户禁用、内置缺省停用 + 用户重新启用
+    assert.deepEqual(inject(), ["GLM-5.3-Flash", "GLM-5.3", "GLM-5.4"]);
+    writePersonal([{ providerId: "account:bigmodel-account", modelId: "GLM-5.3", config: { enabled: false } }]);
+    assert.deepEqual(inject(), ["GLM-5.3-Flash", "GLM-5.4"], "用户在桌面端禁用的模型不出现");
+    writePersonal([]);
+    writeBuiltin([{ providerId: "account:bigmodel-account", modelId: "GLM-5.3-Flash", config: { enabled: false } }]);
+    assert.deepEqual(inject(), ["GLM-5.3", "GLM-5.4"], "目录默认停用的模型不出现");
+    writePersonal([{ providerId: "account:bigmodel-account", modelId: "GLM-5.3-Flash", config: { enabled: true } }]);
+    assert.deepEqual(inject(), ["GLM-5.3-Flash", "GLM-5.3", "GLM-5.4"], "用户重新启用覆盖目录缺省");
+    // 目录缺失时退回仅按用户 modelOrder 列出
+    writePersonal([]);
+    assert.equal(probe._injectCodingPlanProvider(personalPath, path.join(tmp, "missing.json")), outFile);
+    assert.deepEqual(planRule().config.personalModelIds, ["GLM-5.3-Flash", "GLM-5.3"]);
   });
 
 

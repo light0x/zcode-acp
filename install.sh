@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # zcode-acp 一键安装（WSL / Linux / macOS）：
 #   1. 检查 Node.js >= 22
-#   2. 打包 tarball，pnpm 优先全局安装（快照副本，非仓库软链——包管理器对本地目录安装会创建 link，tarball 安装则是快照）
+#   2. 打包 tarball，pnpm 优先全局安装（快照副本，非仓库软链——包管理器对本地目录安装会创建 link，tarball 安装则是快照），
+#      并移除另一包管理器全局的旧副本——只保留一种安装
 #   3. 运行自检（解析 zcode、会话库）
 #   4. 打印本机的 Zed agents.json 配置片段
 # 用法：git clone 本仓库后，在仓库根目录执行 ./install.sh
@@ -13,6 +14,40 @@ say() { printf "${CYAN}==${OFF} %s\n" "$*"; }
 ok() { printf "${GREEN}  ok:${OFF} %s\n" "$*"; }
 warn() { printf "${YELLOW}  !${OFF} %s\n" "$*"; }
 die() { printf "${RED}  error:${OFF} %s\n" "$*" >&2; exit 1; }
+
+# 单一安装收敛：移除另一包管理器全局的 zcode-acp 旧副本，PATH 上只保留本次安装的 shim。
+# 包目录已删而 shim 残留（孤儿）时卸载命令是空操作，故卸载后再按文件名清扫。
+remove_stale_copy() {
+  local other="$1" root bindir present="" has_shim="" name
+  local -a cmd
+  local shim_names="zcode-acp zcode-acp.cmd zcode-acp.ps1"
+  if [ "$other" = npm ]; then
+    root="$(npm root -g 2>/dev/null || true)"
+    bindir="$(npm prefix -g 2>/dev/null || true)"
+    cmd=(npm uninstall -g zcode-acp)
+    # npm 的 shim 在 Unix 位于 <prefix>/bin，在 Git Bash（Windows npm）下位于 prefix 本身
+    case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) ;; *) [ -n "$bindir" ] && bindir="$bindir/bin" ;; esac
+    if [ -n "$root" ] && [ -d "$root/zcode-acp" ]; then present=1; fi
+  else
+    root="$(pnpm root -g 2>/dev/null || true)"
+    bindir="$(pnpm bin -g 2>/dev/null || true)"
+    cmd=(pnpm remove -g zcode-acp)
+    # pnpm ≥12 的包在哈希子目录 <root>/<hash>/node_modules 下
+    if [ -n "$root" ] && { [ -d "$root/zcode-acp" ] || compgen -G "$root/*/node_modules/zcode-acp" >/dev/null; }; then present=1; fi
+  fi
+  for name in $shim_names; do
+    if [ -n "$bindir" ] && [ -f "$bindir/$name" ]; then has_shim=1; fi
+  done
+  if [ -z "$present" ] && [ -z "$has_shim" ]; then return 0; fi
+  if [ -n "$present" ] && ! "${cmd[@]}" >/dev/null 2>&1; then
+    warn "无法移除 $other 全局的 zcode-acp 旧副本，请手动执行：${cmd[*]}（避免 PATH 上 shim 互相遮蔽）"
+    return 0
+  fi
+  for name in $shim_names; do
+    [ -n "$bindir" ] && [ -f "$bindir/$name" ] && rm -f "$bindir/$name"
+  done
+  ok "removed $other 全局的 zcode-acp 旧副本（只保留 $PM 这一种安装）"
+}
 
 say "zcode-acp 安装（$(uname -s) / $(uname -m)）"
 
@@ -102,13 +137,9 @@ if [ "$INSTALL_OK" -eq 0 ]; then
   fi
 fi
 
-# 残留双装检查：另一包管理器全局还留有旧副本时，PATH 上 shim 会互相遮蔽
-if command -v npm >/dev/null 2>&1 && [ "$PM" != npm ] && [ -d "$(npm root -g 2>/dev/null)/zcode-acp" ]; then
-  warn "npm 全局仍装有 zcode-acp（旧副本），建议 npm uninstall -g zcode-acp 后重跑，避免 PATH shim 冲突"
-fi
-if command -v pnpm >/dev/null 2>&1 && [ "$PM" != pnpm ] && [ -d "$(pnpm root -g 2>/dev/null)/zcode-acp" ]; then
-  warn "pnpm 全局仍装有 zcode-acp（旧副本），建议 pnpm rm -g zcode-acp 后重跑，避免 PATH shim 冲突"
-fi
+# 单一安装：另一包管理器全局的旧副本直接移除，PATH 上只保留本次安装的 shim
+if [ "$PM" != npm ] && command -v npm >/dev/null 2>&1; then remove_stale_copy npm; fi
+if [ "$PM" != pnpm ] && command -v pnpm >/dev/null 2>&1; then remove_stale_copy pnpm; fi
 
 # ---------- 3. 自检 ----------
 # 入口解析：pnpm shim 优先——pnpm ≥12 全局目录按次安装哈希编址（<root>/<hash>/node_modules/zcode-acp），
